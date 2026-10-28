@@ -1,0 +1,429 @@
+import 'dotenv/config';
+import crypto from 'node:crypto';
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import { z } from 'zod';
+import { createClient } from '@supabase/supabase-js';
+
+const {
+  PORT = 3000,
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY,
+  JWT_SECRET,
+  JWT_REFRESH_SECRET,
+  JWT_ACCESS_EXPIRES_IN = '7d',
+  JWT_REFRESH_EXPIRES_IN = '90d',
+  CORS_ORIGIN = '*',
+  ONBOARDING_VIDEO_URL = 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4',
+} = process.env;
+
+for (const [name, value] of Object.entries({ SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, JWT_SECRET, JWT_REFRESH_SECRET })) {
+  if (!value) {
+    console.error(`Missing required environment variable: ${name}`);
+    process.exit(1);
+  }
+}
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false, autoRefreshToken: false },
+});
+
+const ACCESS_TTL = JWT_ACCESS_EXPIRES_IN;
+const REFRESH_TTL = JWT_REFRESH_EXPIRES_IN;
+const DAILY_LIMITS = { total: 6, image: 3, video: 3 };
+const AUTOPAY_CANCEL_WARNING =
+  'agar aap autopay cancel karte hain to aap interagood partner nahi rahenge na app intergood ue kar paayenge na aapko koi lead milegi';
+
+const app = express();
+app.set('trust proxy', 1);
+app.use(helmet());
+app.use(cors({ origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN.split(',') }));
+app.use(express.json({ limit: '1mb' }));
+app.use('/api', rateLimit({ windowMs: 60_000, limit: 300, standardHeaders: true, legacyHeaders: false }));
+const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 30, standardHeaders: true, legacyHeaders: false });
+
+// ---------- helpers ----------
+const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+const parse = (schema, data) => {
+  const result = schema.safeParse(data);
+  if (!result.success) {
+    throw new HttpError(400, result.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; '));
+  }
+  return result.data;
+};
+
+const db = (result) => {
+  if (result.error) {
+    if (result.error.code === '23505') throw new HttpError(409, 'Username, email or phone already registered');
+    console.error('[supabase]', result.error);
+    throw new HttpError(500, 'Database error');
+  }
+  return result.data;
+};
+
+const signTokens = (user) => ({
+  accessToken: jwt.sign({ sub: user.id, role: user.role, typ: 'access' }, JWT_SECRET, { expiresIn: ACCESS_TTL }),
+  refreshToken: jwt.sign({ sub: user.id, role: user.role, typ: 'refresh' }, JWT_REFRESH_SECRET, { expiresIn: REFRESH_TTL }),
+});
+
+const normalizePhone = (raw) => {
+  const digits = String(raw || '').replace(/\D/g, '');
+  return digits.length > 10 ? digits.slice(-10) : digits;
+};
+
+const escapeLike = (s) => s.replace(/[\\%_]/g, '\\$&');
+
+// Requires a valid access token whose subject matches :uuid
+const auth = (req, _res, next) => {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return next(new HttpError(401, 'Missing token'));
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    if (payload.typ !== 'access') throw new Error('wrong token type');
+    if (req.params.uuid && payload.sub !== req.params.uuid) return next(new HttpError(403, 'Forbidden'));
+    req.auth = payload;
+    next();
+  } catch {
+    next(new HttpError(401, 'Invalid or expired token'));
+  }
+};
+
+const sanitizeUser = ({ password_hash, ...rest }) => rest;
+
+const getUser = async (id) => {
+  const user = db(await supabase.from('users').select('*').eq('id', id).maybeSingle());
+  if (!user) throw new HttpError(404, 'User not found');
+  return user;
+};
+
+const updateUser = async (id, updates) => {
+  const rows = db(
+    await supabase.from('users').update({ ...updates, updated_at: new Date().toISOString() }).eq('id', id).select('id'),
+  );
+  if (!rows.length) throw new HttpError(404, 'User not found');
+};
+
+// Start of the current day in IST (UTC+5:30) as an ISO string
+const startOfTodayIST = () => {
+  const offsetMs = 5.5 * 3600_000;
+  const shifted = new Date(Date.now() + offsetMs);
+  shifted.setUTCHours(0, 0, 0, 0);
+  return new Date(shifted.getTime() - offsetMs).toISOString();
+};
+
+// ---------- health ----------
+app.get('/', (_req, res) => res.json({ service: 'interagood-backend', status: 'ok' }));
+app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+
+// ---------- auth ----------
+app.get(
+  '/api/check-availability',
+  wrap(async (req, res) => {
+    const { field } = req.query;
+    let value = String(req.query.value || '').trim();
+    if (!['username', 'email', 'phone'].includes(field)) throw new HttpError(400, 'Invalid field');
+
+    if (field === 'phone') value = normalizePhone(value);
+    const valid =
+      (field === 'phone' && value.length === 10) ||
+      (field === 'email' && /^\S+@\S+\.\S+$/.test(value)) ||
+      (field === 'username' && value.length >= 3);
+    if (!valid) return res.json({ field, value, available: false });
+
+    let query = supabase.from('users').select('id').limit(1);
+    query = field === 'phone' ? query.eq('phone', value) : query.ilike(field, escapeLike(value));
+    const rows = db(await query);
+    res.json({ field, value, available: rows.length === 0 });
+  }),
+);
+
+const registerSchema = z.object({
+  role: z.enum(['partner', 'supplier']),
+  phone: z.string().transform(normalizePhone).pipe(z.string().length(10, 'must be 10 digits')),
+  email: z.string().trim().toLowerCase().email().max(120),
+  username: z.string().trim().min(3).max(60),
+  password: z.string().min(6).max(100),
+});
+
+app.post(
+  '/api/register',
+  authLimiter,
+  wrap(async (req, res) => {
+    const body = parse(registerSchema, req.body);
+    const user = db(
+      await supabase
+        .from('users')
+        .insert({
+          id: crypto.randomUUID(),
+          role: body.role,
+          phone: body.phone,
+          email: body.email,
+          username: body.username,
+          password_hash: await bcrypt.hash(body.password, 10),
+          is_online: true,
+        })
+        .select('id, role')
+        .single(),
+    );
+    res.status(201).json({ success: true, uuid: user.id, role: user.role, ...signTokens(user) });
+  }),
+);
+
+const loginSchema = z.object({ identifier: z.string().trim().min(1), password: z.string().min(1) });
+
+app.post(
+  '/api/login',
+  authLimiter,
+  wrap(async (req, res) => {
+    const { identifier, password } = parse(loginSchema, req.body);
+    const column = identifier.includes('@') ? 'email' : /^[\d+\s-]{10,}$/.test(identifier) ? 'phone' : 'username';
+    const value = column === 'phone' ? normalizePhone(identifier) : identifier;
+    const user = db(await supabase.from('users').select('*').ilike(column, escapeLike(value)).maybeSingle());
+    if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+      throw new HttpError(401, 'Invalid credentials');
+    }
+    res.json({ success: true, uuid: user.id, role: user.role, username: user.username, ...signTokens(user) });
+  }),
+);
+
+app.post(
+  '/api/auth/refresh',
+  authLimiter,
+  wrap(async (req, res) => {
+    const { refreshToken } = parse(z.object({ refreshToken: z.string().min(1) }), req.body);
+    let payload;
+    try {
+      payload = jwt.verify(refreshToken, JWT_REFRESH_SECRET);
+      if (payload.typ !== 'refresh') throw new Error();
+    } catch {
+      throw new HttpError(401, 'Invalid or expired refresh token');
+    }
+    const user = await getUser(payload.sub);
+    res.json({ success: true, ...signTokens(user) });
+  }),
+);
+
+// ---------- master data ----------
+const categoryRoute = (table) =>
+  wrap(async (_req, res) => {
+    const rows = db(await supabase.from(table).select('id, name, hindi_name, icon_name').eq('is_active', true).order('id'));
+    res.json({ success: true, data: rows.map(({ icon_name, ...c }) => ({ ...c, icon: icon_name })) });
+  });
+
+app.get('/api/categories/partner', categoryRoute('partner_categories'));
+app.get('/api/categories/supplier', categoryRoute('supplier_categories'));
+
+app.get(
+  '/api/age-options',
+  wrap(async (_req, res) => {
+    const rows = db(await supabase.from('master_ages').select('age_value').order('age_value'));
+    res.json({ success: true, data: rows.map((r) => r.age_value) });
+  }),
+);
+
+app.get('/api/media/onboarding-video', (_req, res) => res.redirect(302, ONBOARDING_VIDEO_URL));
+
+// ---------- user ----------
+const profileSchema = z.object({
+  category_id: z.coerce.number().int().positive(),
+  category_name: z.string().trim().min(1).max(100),
+  full_name: z.string().trim().min(1).max(120),
+  address: z.string().trim().min(1),
+  city: z.string().trim().min(1).max(80),
+  state: z.string().trim().min(1).max(80),
+  pincode: z.string().trim().regex(/^\d{6}$/, 'must be 6 digits'),
+  latitude: z.coerce.number().min(-90).max(90).nullish(),
+  longitude: z.coerce.number().min(-180).max(180).nullish(),
+});
+
+app.patch(
+  '/api/users/:uuid/profile',
+  auth,
+  wrap(async (req, res) => {
+    await updateUser(req.params.uuid, parse(profileSchema, req.body));
+    res.json({ success: true, message: 'Profile updated' });
+  }),
+);
+
+const optBool = z.boolean().nullish();
+const optUrl = z.string().url().nullish().or(z.literal(''));
+const businessSchema = z.object({
+  business_name: z.string().trim().min(1).max(150),
+  profile_photo_url: optUrl,
+  banner_url: optUrl,
+  age: z.coerce.number().int().min(20).max(65).nullish(),
+  experience_years: z.coerce.number().int().min(4).max(20).nullish(),
+  has_toolbox: optBool,
+  toolbox_image_url: optUrl,
+  has_team: optBool,
+  team_members_count: z.coerce.number().int().min(0).nullish(),
+  team_image_url: optUrl,
+  knows_work_completely: optBool,
+  knows_measurement_system: optBool,
+  can_deal_with_customers: optBool,
+  can_manage_quotation_workflow: optBool,
+  knows_pricing: optBool,
+});
+
+const PARTNER_ONLY_FIELDS = [
+  'age', 'experience_years', 'has_toolbox', 'toolbox_image_url', 'has_team', 'team_members_count',
+  'team_image_url', 'knows_work_completely', 'knows_measurement_system', 'can_deal_with_customers',
+  'can_manage_quotation_workflow', 'knows_pricing',
+];
+
+app.patch(
+  '/api/users/:uuid/business-profile',
+  auth,
+  wrap(async (req, res) => {
+    const updates = parse(businessSchema, req.body);
+    for (const key of ['profile_photo_url', 'banner_url', 'toolbox_image_url', 'team_image_url']) {
+      if (updates[key] === '') updates[key] = null;
+    }
+    // Role comes from the token, never from the request body
+    if (req.auth.role === 'supplier') {
+      for (const key of PARTNER_ONLY_FIELDS) updates[key] = null;
+    }
+    await updateUser(req.params.uuid, updates);
+    res.json({ success: true, message: 'Business profile saved' });
+  }),
+);
+
+app.post(
+  '/api/users/:uuid/onboarding',
+  auth,
+  wrap(async (req, res) => {
+    const { terms_accepted } = parse(z.object({ terms_accepted: z.literal(true) }), req.body);
+    const mandateId = `MNDT_${crypto.randomInt(10_000_000, 100_000_000)}`;
+    await updateUser(req.params.uuid, {
+      terms_accepted,
+      is_autopay_active: true,
+      autopay_mandate_id: mandateId,
+      leads_status: req.auth.role === 'partner' ? 'leads_activated' : 'deals_activated',
+    });
+    res.json({ success: true, message: 'Onboarding completed', mandate_id: mandateId });
+  }),
+);
+
+app.get(
+  '/api/users/:uuid',
+  auth,
+  wrap(async (req, res) => {
+    const user = await getUser(req.params.uuid);
+    const samples = db(
+      await supabase
+        .from('user_samples')
+        .select('id, media_type, title, media_url, thumbnail_url, created_at')
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: false }),
+    );
+    res.json({ success: true, data: { ...sanitizeUser(user), samples } });
+  }),
+);
+
+app.patch(
+  '/api/users/:uuid/status',
+  auth,
+  wrap(async (req, res) => {
+    const { is_online } = parse(z.object({ is_online: z.boolean() }), req.body);
+    await updateUser(req.params.uuid, { is_online });
+    res.json({ success: true, is_online });
+  }),
+);
+
+// ---------- samples (daily quota: 6 total, 3 images, 3 videos) ----------
+const sampleSchema = z.object({
+  media_type: z.enum(['image', 'video']),
+  title: z.string().trim().max(120).optional(),
+  media_url: z.string().url(),
+  thumbnail_url: z.string().url().nullish(),
+});
+
+app.post(
+  '/api/users/:uuid/samples',
+  auth,
+  wrap(async (req, res) => {
+    const body = parse(sampleSchema, req.body);
+    const today = db(
+      await supabase
+        .from('user_samples')
+        .select('media_type')
+        .eq('user_id', req.params.uuid)
+        .gte('created_at', startOfTodayIST()),
+    );
+    if (today.length >= DAILY_LIMITS.total) {
+      throw new HttpError(429, `Daily limit of ${DAILY_LIMITS.total} uploads reached for today.`);
+    }
+    const sameType = today.filter((s) => s.media_type === body.media_type).length;
+    if (sameType >= DAILY_LIMITS[body.media_type]) {
+      throw new HttpError(429, `Daily maximum of ${DAILY_LIMITS[body.media_type]} ${body.media_type}s reached.`);
+    }
+    const sample = db(
+      await supabase
+        .from('user_samples')
+        .insert({
+          user_id: req.params.uuid,
+          media_type: body.media_type,
+          title: body.title || 'Showcase Work',
+          media_url: body.media_url,
+          thumbnail_url: body.thumbnail_url ?? null,
+        })
+        .select('id, media_type, title, media_url, thumbnail_url, created_at')
+        .single(),
+    );
+    res.status(201).json({ success: true, data: sample });
+  }),
+);
+
+app.delete(
+  '/api/users/:uuid/samples/:sampleId',
+  auth,
+  wrap(async (req, res) => {
+    if (!z.string().uuid().safeParse(req.params.sampleId).success) throw new HttpError(400, 'Invalid sample id');
+    db(await supabase.from('user_samples').delete().eq('id', req.params.sampleId).eq('user_id', req.params.uuid));
+    res.json({ success: true, message: 'Sample deleted' });
+  }),
+);
+
+// ---------- account ----------
+app.post(
+  '/api/users/:uuid/cancel-autopay',
+  auth,
+  wrap(async (req, res) => {
+    await updateUser(req.params.uuid, { is_autopay_active: false, leads_status: 'cancelled' });
+    res.json({ success: true, warning: AUTOPAY_CANCEL_WARNING });
+  }),
+);
+
+app.delete(
+  '/api/users/:uuid',
+  auth,
+  wrap(async (req, res) => {
+    db(await supabase.from('users').delete().eq('id', req.params.uuid));
+    res.json({ success: true, message: 'Account deleted' });
+  }),
+);
+
+// ---------- errors ----------
+app.use('/api', (_req, _res, next) => next(new HttpError(404, 'Route not found')));
+
+app.use((err, _req, res, _next) => {
+  if (err.type === 'entity.parse.failed') return res.status(400).json({ success: false, message: 'Invalid JSON' });
+  const status = err.status || 500;
+  if (status >= 500) console.error(err);
+  res.status(status).json({ success: false, message: status >= 500 ? 'Internal server error' : err.message });
+});
+
+app.listen(PORT, '0.0.0.0', () => console.log(`[interagood-backend] listening on port ${PORT}`));

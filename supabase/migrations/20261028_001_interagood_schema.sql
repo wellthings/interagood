@@ -1,0 +1,134 @@
+-- Interagood Database Schema Migration for Supabase
+-- Target: PostgreSQL / Supabase
+-- Author: Interagood Platform Team
+
+-- Enable UUID extension if not already available
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- 1. Partner Categories Table (10 initial categories)
+CREATE TABLE IF NOT EXISTS partner_categories (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL UNIQUE,
+    hindi_name VARCHAR(100) NOT NULL,
+    icon_name VARCHAR(50) DEFAULT 'wrench',
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 2. Supplier Categories Table
+CREATE TABLE IF NOT EXISTS supplier_categories (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL UNIQUE,
+    hindi_name VARCHAR(100) NOT NULL,
+    icon_name VARCHAR(50) DEFAULT 'store',
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 3. Age Master Table (Greater than 19 years: 20 to 65 years)
+CREATE TABLE IF NOT EXISTS master_ages (
+    id SERIAL PRIMARY KEY,
+    age_value INT NOT NULL UNIQUE CHECK (age_value >= 20)
+);
+
+-- 4. Single Unified Users Table
+-- Holds both Partner and Supplier details in a single progressive row updated by UUID
+CREATE TABLE IF NOT EXISTS users (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    role VARCHAR(20) NOT NULL CHECK (role IN ('partner', 'supplier')),
+    
+    -- Step 1: Registration Credentials
+    username VARCHAR(60) NOT NULL UNIQUE,
+    email VARCHAR(120) NOT NULL UNIQUE,
+    phone VARCHAR(20) NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    
+    -- Step 2: Personal Profile Details
+    category_id INT,
+    category_name VARCHAR(100),
+    full_name VARCHAR(120),
+    address TEXT,
+    city VARCHAR(80),
+    state VARCHAR(80),
+    pincode VARCHAR(10),
+    latitude NUMERIC(10, 7), -- Stored only in backend DB, not shown in UI
+    longitude NUMERIC(10, 7), -- Stored only in backend DB, not shown in UI
+    
+    -- Step 3: Business Profile Details
+    business_name VARCHAR(150),
+    profile_photo_url TEXT,
+    banner_url TEXT,
+    
+    -- Partner Specific (Nullable for Supplier)
+    age INT,
+    experience_years INT CHECK (experience_years >= 4 AND experience_years <= 20),
+    has_toolbox BOOLEAN DEFAULT FALSE,
+    toolbox_image_url TEXT,
+    has_team BOOLEAN DEFAULT FALSE,
+    team_members_count INT DEFAULT 0,
+    team_image_url TEXT,
+    knows_work_completely BOOLEAN DEFAULT FALSE,
+    knows_measurement_system BOOLEAN DEFAULT FALSE,
+    can_deal_with_customers BOOLEAN DEFAULT FALSE,
+    can_manage_quotation_workflow BOOLEAN DEFAULT FALSE,
+    knows_pricing BOOLEAN DEFAULT FALSE,
+    
+    -- Step 4: Onboarding & Subscription Details
+    terms_accepted BOOLEAN DEFAULT FALSE,
+    is_autopay_active BOOLEAN DEFAULT FALSE,
+    autopay_mandate_id VARCHAR(100),
+    leads_status VARCHAR(40) DEFAULT 'inactive', -- 'leads_activated' for partner, 'deals_activated' for supplier
+    
+    -- Status & Controls
+    is_online BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 5. User Daily Upload Samples Table (Daily Limit: 6 items max - 3 images & 3 videos)
+CREATE TABLE IF NOT EXISTS user_samples (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    media_type VARCHAR(10) NOT NULL CHECK (media_type IN ('image', 'video')),
+    title VARCHAR(120),
+    media_url TEXT NOT NULL,
+    thumbnail_url TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Indexes for lightning fast lookups
+CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_phone ON users(phone);
+CREATE INDEX IF NOT EXISTS idx_user_samples_user_day ON user_samples(user_id, created_at);
+
+-- Seed Data for Partner Categories
+INSERT INTO partner_categories (name, hindi_name, icon_name) VALUES
+('Carpenter', 'बढ़ई (लकड़ी का काम)', 'hammer'),
+('Plumber', 'प्लम्बर (नल व पाइप फिटिंग)', 'droplet'),
+('Painter', 'पेंटर व पॉलिशर (दीवार व फर्नीचर)', 'paint-brush'),
+('Electrician', 'इलेक्ट्रीशियन (वायरिंग व उपकरण)', 'zap'),
+('Mason / Rajmistri', 'राजमिस्त्री (चिनाई व प्लास्टर)', 'wall'),
+('Welder & Fabricator', 'वेल्डर व फेब्रिकेटर (लोहा व स्टील)', 'flame'),
+('False Ceiling & POP', 'फॉल्स सीलिंग व पीओपी कारीगर', 'layers'),
+('Tile & Marble Mason', 'टाइल्स व मार्बल कारीगर', 'grid'),
+('Interior Decorator', 'इंटीरियर डेकोरेटर व फर्निशर', 'home'),
+('Glass & Aluminum Worker', 'ग्लास व एल्युमिनियम कारीगर', 'maximize')
+ON CONFLICT (name) DO NOTHING;
+
+-- Seed Data for Supplier Categories
+INSERT INTO supplier_categories (name, hindi_name, icon_name) VALUES
+('Plywood & Timber Shop', 'प्लाईवुड व टिम्बर स्टोर', 'tree'),
+('Tiles & Sanitary Shop', 'टाइल्स व सेनेटरी वेयर', 'layout-grid'),
+('Paint & Polish Store', 'पेंट, प्राइमर व पॉलिश शॉप', 'palette'),
+('Hardware & Tools Store', 'हार्डवेयर, फिटिंग्स व टूल्स', 'tool'),
+('Electrical Supply Shop', 'इलेक्ट्रिकल वायर्स व स्विच शॉप', 'zap'),
+('Glass & Mirror Studio', 'ग्लास, टफन व मिरर डीलर', 'square'),
+('Marble & Granite Dealer', 'मार्बल, ग्रेनाइट व कोटा स्टोन', 'mountain'),
+('Cement & Building Materials', 'सीमेंट, रेत व रोड़ी सप्लायर', 'package')
+ON CONFLICT (name) DO NOTHING;
+
+-- Seed Data for Master Ages (20 to 65 years)
+INSERT INTO master_ages (age_value)
+SELECT generate_series(20, 65)
+ON CONFLICT (age_value) DO NOTHING;
