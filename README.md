@@ -19,5 +19,7 @@ npm run dev
 4. Generate a public domain; health check is `/health`.
 
 ## API (all under `/api`)
-Public: `GET check-availability`, `POST register`, `POST login`, `POST auth/refresh`, `GET categories/{partner|supplier}`, `GET age-options`, `GET media/onboarding-video`.
-Bearer token required (token must belong to `:uuid`): `GET|DELETE users/:uuid`, `PATCH users/:uuid/{profile|business-profile|status}`, `POST users/:uuid/{onboarding|cancel-autopay|samples}`, `DELETE users/:uuid/samples/:sampleId`.
+Public: `GET check-availability`, `POST register`, `POST login`, `POST auth/refresh`, `GET categories/{partner|supplier}`, `GET age-options`, `GET media/onboarding-video` (redirects to Supabase Storage `media/onboarding/intro.mp4`, or `ONBOARDING_VIDEO_URL` if set).
+Bearer token required (token must belong to `:uuid`): `GET|DELETE users/:uuid`, `PATCH users/:uuid/{profile|business-profile|branding|status}`, `POST users/:uuid/{onboarding|cancel-autopay|samples}`, `POST users/:uuid/upload?kind={profile|banner|toolbox|team|sample}` (raw image/video body, returns public URL), `DELETE users/:uuid/samples/:sampleId`.
+
+Storage: the public bucket `media` (override with `STORAGE_BUCKET`) is created automatically on startup. Upload the onboarding video to `media/onboarding/intro.mp4`.
