@@ -18,7 +18,8 @@ const {
   JWT_ACCESS_EXPIRES_IN = '7d',
   JWT_REFRESH_EXPIRES_IN = '90d',
   CORS_ORIGIN = '*',
-  ONBOARDING_VIDEO_URL = 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4',
+  STORAGE_BUCKET = 'media',
+  ONBOARDING_VIDEO_URL,
 } = process.env;
 
 for (const [name, value] of Object.entries({ SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, JWT_SECRET, JWT_REFRESH_SECRET })) {
@@ -32,6 +33,15 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
 
+// Public bucket holding all user uploads and the onboarding video (onboarding/intro.mp4)
+const publicUrl = (path) => supabase.storage.from(STORAGE_BUCKET).getPublicUrl(path).data.publicUrl;
+supabase.storage
+  .createBucket(STORAGE_BUCKET, { public: true })
+  .then(({ error }) => error && !/already exists/i.test(error.message) && console.error('[storage]', error.message));
+
+const UPLOAD_TYPES = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'video/mp4': 'mp4', 'video/quicktime': 'mov' };
+const UPLOAD_KINDS = ['profile', 'banner', 'toolbox', 'team', 'sample'];
+
 const ACCESS_TTL = JWT_ACCESS_EXPIRES_IN;
 const REFRESH_TTL = JWT_REFRESH_EXPIRES_IN;
 const DAILY_LIMITS = { total: 6, image: 3, video: 3 };
@@ -43,6 +53,7 @@ app.set('trust proxy', 1);
 app.use(helmet());
 app.use(cors({ origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN.split(',') }));
 app.use(express.json({ limit: '1mb' }));
+app.use(express.raw({ type: Object.keys(UPLOAD_TYPES), limit: '50mb' }));
 app.use('/api', rateLimit({ windowMs: 60_000, limit: 300, standardHeaders: true, legacyHeaders: false }));
 const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 30, standardHeaders: true, legacyHeaders: false });
 
@@ -101,7 +112,8 @@ const auth = (req, _res, next) => {
   }
 };
 
-const sanitizeUser = ({ password_hash, ...rest }) => rest;
+// Coordinates stay in the DB only and are never sent to the app
+const sanitizeUser = ({ password_hash, latitude, longitude, ...rest }) => rest;
 
 const getUser = async (id) => {
   const user = db(await supabase.from('users').select('*').eq('id', id).maybeSingle());
@@ -234,7 +246,9 @@ app.get(
   }),
 );
 
-app.get('/api/media/onboarding-video', (_req, res) => res.redirect(302, ONBOARDING_VIDEO_URL));
+app.get('/api/media/onboarding-video', (_req, res) =>
+  res.redirect(302, ONBOARDING_VIDEO_URL || publicUrl('onboarding/intro.mp4')),
+);
 
 // ---------- user ----------
 const profileSchema = z.object({
@@ -253,7 +267,11 @@ app.patch(
   '/api/users/:uuid/profile',
   auth,
   wrap(async (req, res) => {
-    await updateUser(req.params.uuid, parse(profileSchema, req.body));
+    const body = parse(profileSchema, req.body);
+    if (req.auth.role === 'supplier' && !(body.latitude && body.longitude)) {
+      throw new HttpError(400, 'Supplier must provide shop location');
+    }
+    await updateUser(req.params.uuid, body);
     res.json({ success: true, message: 'Profile updated' });
   }),
 );
@@ -295,9 +313,33 @@ app.patch(
     // Role comes from the token, never from the request body
     if (req.auth.role === 'supplier') {
       for (const key of PARTNER_ONLY_FIELDS) updates[key] = null;
+    } else {
+      if (!updates.age || !updates.experience_years) throw new HttpError(400, 'Age and experience are required');
+      if (updates.has_toolbox && !updates.toolbox_image_url) throw new HttpError(400, 'Toolbox image is required');
+      if (updates.has_team && (!updates.team_image_url || !(updates.team_members_count > 0))) {
+        throw new HttpError(400, 'Team image and member count are required');
+      }
+      if (!updates.has_toolbox) updates.toolbox_image_url = null;
+      if (!updates.has_team) Object.assign(updates, { team_image_url: null, team_members_count: null });
     }
     await updateUser(req.params.uuid, updates);
     res.json({ success: true, message: 'Business profile saved' });
+  }),
+);
+
+// Home-screen profile edit: only business name, photo and banner are editable
+const brandingSchema = z.object({
+  business_name: z.string().trim().min(1).max(150),
+  profile_photo_url: z.string().url(),
+  banner_url: z.string().url(),
+});
+
+app.patch(
+  '/api/users/:uuid/branding',
+  auth,
+  wrap(async (req, res) => {
+    await updateUser(req.params.uuid, parse(brandingSchema, req.body));
+    res.json({ success: true, message: 'Profile updated' });
   }),
 );
 
@@ -340,6 +382,28 @@ app.patch(
     const { is_online } = parse(z.object({ is_online: z.boolean() }), req.body);
     await updateUser(req.params.uuid, { is_online });
     res.json({ success: true, is_online });
+  }),
+);
+
+// ---------- media upload (raw binary body -> Supabase Storage -> public URL) ----------
+app.post(
+  '/api/users/:uuid/upload',
+  auth,
+  wrap(async (req, res) => {
+    const kind = String(req.query.kind || '');
+    const ext = UPLOAD_TYPES[req.headers['content-type']?.split(';')[0]];
+    if (!UPLOAD_KINDS.includes(kind)) throw new HttpError(400, 'Invalid kind');
+    if (!ext || !Buffer.isBuffer(req.body) || !req.body.length) throw new HttpError(400, 'Unsupported or empty file');
+    if ((ext === 'mp4' || ext === 'mov') && kind !== 'sample') throw new HttpError(400, 'Videos allowed only for samples');
+    const path = `${req.params.uuid}/${kind}-${Date.now()}.${ext}`;
+    const { error } = await supabase.storage
+      .from(STORAGE_BUCKET)
+      .upload(path, req.body, { contentType: req.headers['content-type'].split(';')[0] });
+    if (error) {
+      console.error('[storage]', error.message);
+      throw new HttpError(500, 'Upload failed');
+    }
+    res.status(201).json({ success: true, url: publicUrl(path) });
   }),
 );
 
