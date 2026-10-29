@@ -258,7 +258,7 @@ const profileSchema = z.object({
   address: z.string().trim().min(1),
   city: z.string().trim().min(1).max(80),
   state: z.string().trim().min(1).max(80),
-  pincode: z.string().trim().regex(/^\d{6}$/, 'must be 6 digits'),
+  pincode: z.string().trim().min(1).max(20),
   latitude: z.coerce.number().min(-90).max(90).nullish(),
   longitude: z.coerce.number().min(-180).max(180).nullish(),
 });
