@@ -181,7 +181,7 @@ const getPlanId = async (role) => {
       interval: 1,
       item: {
         name: spec.name,
-        description: `Monthly ${role} subscription`,
+        description: `Official ${role} subscription for InteraGood platform`,
         amount: spec.amountPaise,
         currency: 'INR',
       },
