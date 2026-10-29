@@ -23,3 +23,7 @@ Public: `GET check-availability`, `POST register`, `POST login`, `POST auth/refr
 Bearer token required (token must belong to `:uuid`): `GET|DELETE users/:uuid`, `PATCH users/:uuid/{profile|business-profile|branding|status}`, `POST users/:uuid/{onboarding|cancel-autopay|samples}`, `POST users/:uuid/upload?kind={profile|banner|toolbox|team|sample}` (raw image/video body, returns public URL), `DELETE users/:uuid/samples/:sampleId`.
 
 Storage: the public bucket `media` (override with `STORAGE_BUCKET`) is created automatically on startup. Upload the onboarding video to `media/onboarding/intro.mp4`.
+
+Supplier onboarding: video and terms are read from the private bucket `guid media` (`GUIDE_BUCKET`, `SUPPLIER_VIDEO_PATH`, `SUPPLIER_TERMS_PATH`) via `GET media/supplier-onboarding-video` and `GET content/supplier-terms`.
+
+Supplier payment (Razorpay Subscriptions, Rs 219/month, first charge at authorization): set `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET` (optional `RAZORPAY_PLAN_ID`; otherwise the plan is found/created automatically). `POST users/:uuid/subscription` creates the subscription from the user's own phone/email, `POST users/:uuid/subscription/verify` checks the signature and activates the supplier. Point a Razorpay webhook to `POST /api/razorpay/webhook` with events `subscription.activated|charged|halted|cancelled|completed|paused`.

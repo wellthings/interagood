@@ -23,6 +23,10 @@ const {
   GUIDE_BUCKET = 'guid media',
   SUPPLIER_VIDEO_PATH = 'video files/supplier.mp4',
   SUPPLIER_TERMS_PATH = 'application files/suppliert&c',
+  RAZORPAY_KEY_ID,
+  RAZORPAY_KEY_SECRET,
+  RAZORPAY_WEBHOOK_SECRET,
+  RAZORPAY_PLAN_ID,
 } = process.env;
 
 for (const [name, value] of Object.entries({ SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, JWT_SECRET, JWT_REFRESH_SECRET })) {
@@ -55,7 +59,14 @@ const app = express();
 app.set('trust proxy', 1);
 app.use(helmet());
 app.use(cors({ origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN.split(',') }));
-app.use(express.json({ limit: '1mb' }));
+app.use(
+  express.json({
+    limit: '1mb',
+    verify: (req, _res, buf) => {
+      req.rawBody = buf;
+    },
+  }),
+);
 app.use(express.raw({ type: Object.keys(UPLOAD_TYPES), limit: '50mb' }));
 app.use('/api', rateLimit({ windowMs: 60_000, limit: 300, standardHeaders: true, legacyHeaders: false }));
 const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 30, standardHeaders: true, legacyHeaders: false });
@@ -130,6 +141,66 @@ const updateUser = async (id, updates) => {
   );
   if (!rows.length) throw new HttpError(404, 'User not found');
 };
+
+// ---------- razorpay ----------
+const SUPPLIER_PLAN = { key: 'interagood_supplier_219', amountPaise: 21900, totalCount: 120 };
+let cachedPlanId = RAZORPAY_PLAN_ID || null;
+
+const rzp = async (method, path, body) => {
+  if (!RAZORPAY_KEY_ID || !RAZORPAY_KEY_SECRET) throw new HttpError(503, 'Payments are not configured');
+  const res = await fetch(`https://api.razorpay.com/v1${path}`, {
+    method,
+    headers: {
+      Authorization: `Basic ${Buffer.from(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`).toString('base64')}`,
+      'Content-Type': 'application/json',
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    console.error('[razorpay]', method, path, res.status, data.error);
+    throw new HttpError(502, data.error?.description || 'Payment provider error');
+  }
+  return data;
+};
+
+// Monthly Rs 219 plan: uses RAZORPAY_PLAN_ID if set, otherwise finds or creates it once
+const getSupplierPlanId = async () => {
+  if (cachedPlanId) return cachedPlanId;
+  const list = await rzp('GET', '/plans?count=100');
+  const existing = list.items?.find((p) => p.notes?.key === SUPPLIER_PLAN.key && p.item?.amount === SUPPLIER_PLAN.amountPaise);
+  const plan =
+    existing ||
+    (await rzp('POST', '/plans', {
+      period: 'monthly',
+      interval: 1,
+      item: {
+        name: 'InteraGood Supplier Program',
+        description: 'Monthly supplier subscription',
+        amount: SUPPLIER_PLAN.amountPaise,
+        currency: 'INR',
+      },
+      notes: { key: SUPPLIER_PLAN.key },
+    }));
+  cachedPlanId = plan.id;
+  return cachedPlanId;
+};
+
+const safeEqualHex = (a, b) => {
+  const x = Buffer.from(String(a || ''), 'utf8');
+  const y = Buffer.from(String(b || ''), 'utf8');
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+};
+
+const hmacHex = (secret, data) => crypto.createHmac('sha256', secret).update(data).digest('hex');
+
+const activateSupplier = (id, subscriptionId) =>
+  updateUser(id, {
+    terms_accepted: true,
+    is_autopay_active: true,
+    autopay_mandate_id: subscriptionId,
+    leads_status: 'deals_activated',
+  });
 
 // Start of the current day in IST (UTC+5:30) as an ISO string
 const startOfTodayIST = () => {
@@ -375,6 +446,7 @@ app.post(
   '/api/users/:uuid/onboarding',
   auth,
   wrap(async (req, res) => {
+    if (req.auth.role === 'supplier') throw new HttpError(403, 'Suppliers must complete onboarding through the payment flow');
     const { terms_accepted } = parse(z.object({ terms_accepted: z.literal(true) }), req.body);
     const mandateId = `MNDT_${crypto.randomInt(10_000_000, 100_000_000)}`;
     await updateUser(req.params.uuid, {
@@ -384,6 +456,85 @@ app.post(
       leads_status: req.auth.role === 'partner' ? 'leads_activated' : 'deals_activated',
     });
     res.json({ success: true, message: 'Onboarding completed', mandate_id: mandateId });
+  }),
+);
+
+// Supplier: creates the Rs 219/month AutoPay subscription; the first charge happens at authorization.
+// Contact and email come from the user's row, never from the client.
+app.post(
+  '/api/users/:uuid/subscription',
+  auth,
+  wrap(async (req, res) => {
+    const user = await getUser(req.params.uuid);
+    if (user.role !== 'supplier') throw new HttpError(403, 'Only suppliers can subscribe');
+    if (user.is_autopay_active) throw new HttpError(409, 'AutoPay is already active');
+
+    const subscription = await rzp('POST', '/subscriptions', {
+      plan_id: await getSupplierPlanId(),
+      total_count: SUPPLIER_PLAN.totalCount,
+      quantity: 1,
+      customer_notify: 1,
+      notes: { user_id: user.id },
+    });
+
+    res.json({
+      success: true,
+      key_id: RAZORPAY_KEY_ID,
+      subscription_id: subscription.id,
+      amount: SUPPLIER_PLAN.amountPaise / 100,
+      name: user.full_name || user.business_name || user.username,
+      contact: `+91${normalizePhone(user.phone)}`,
+      email: user.email,
+    });
+  }),
+);
+
+const verifySubscriptionSchema = z.object({
+  razorpay_payment_id: z.string().min(1),
+  razorpay_subscription_id: z.string().min(1),
+  razorpay_signature: z.string().min(1),
+});
+
+app.post(
+  '/api/users/:uuid/subscription/verify',
+  auth,
+  wrap(async (req, res) => {
+    const body = parse(verifySubscriptionSchema, req.body);
+    if (!RAZORPAY_KEY_SECRET) throw new HttpError(503, 'Payments are not configured');
+
+    const expected = hmacHex(RAZORPAY_KEY_SECRET, `${body.razorpay_payment_id}|${body.razorpay_subscription_id}`);
+    if (!safeEqualHex(expected, body.razorpay_signature)) throw new HttpError(400, 'Payment verification failed');
+
+    const subscription = await rzp('GET', `/subscriptions/${encodeURIComponent(body.razorpay_subscription_id)}`);
+    if (subscription.notes?.user_id !== req.params.uuid) throw new HttpError(403, 'Subscription does not belong to this user');
+    if (!['authenticated', 'active'].includes(subscription.status)) throw new HttpError(400, `Subscription is ${subscription.status}`);
+
+    await activateSupplier(req.params.uuid, subscription.id);
+    res.json({ success: true, message: 'AutoPay activated', subscription_id: subscription.id });
+  }),
+);
+
+// Keeps the user row in sync with Razorpay (renewals, failed charges, cancellations)
+app.post(
+  '/api/razorpay/webhook',
+  wrap(async (req, res) => {
+    if (!RAZORPAY_WEBHOOK_SECRET) throw new HttpError(503, 'Webhook not configured');
+    const signature = req.get('x-razorpay-signature');
+    if (!req.rawBody || !safeEqualHex(hmacHex(RAZORPAY_WEBHOOK_SECRET, req.rawBody), signature)) {
+      throw new HttpError(400, 'Invalid signature');
+    }
+
+    const subscription = req.body?.payload?.subscription?.entity;
+    const userId = subscription?.notes?.user_id;
+    if (userId && z.string().uuid().safeParse(userId).success) {
+      const event = req.body.event;
+      if (['subscription.activated', 'subscription.charged'].includes(event)) {
+        await activateSupplier(userId, subscription.id);
+      } else if (['subscription.halted', 'subscription.cancelled', 'subscription.completed', 'subscription.paused'].includes(event)) {
+        await updateUser(userId, { is_autopay_active: false, leads_status: 'inactive' });
+      }
+    }
+    res.json({ success: true });
   }),
 );
 
@@ -494,6 +645,10 @@ app.post(
   '/api/users/:uuid/cancel-autopay',
   auth,
   wrap(async (req, res) => {
+    const user = await getUser(req.params.uuid);
+    if (user.autopay_mandate_id?.startsWith('sub_')) {
+      await rzp('POST', `/subscriptions/${user.autopay_mandate_id}/cancel`, { cancel_at_cycle_end: 0 });
+    }
     await updateUser(req.params.uuid, { is_autopay_active: false, leads_status: 'cancelled' });
     res.json({ success: true, warning: AUTOPAY_CANCEL_WARNING });
   }),
