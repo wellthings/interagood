@@ -20,6 +20,9 @@ const {
   CORS_ORIGIN = '*',
   STORAGE_BUCKET = 'media',
   ONBOARDING_VIDEO_URL,
+  GUIDE_BUCKET = 'guid media',
+  SUPPLIER_VIDEO_PATH = 'video files/supplier.mp4',
+  SUPPLIER_TERMS_PATH = 'application files/suppliert&c',
 } = process.env;
 
 for (const [name, value] of Object.entries({ SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, JWT_SECRET, JWT_REFRESH_SECRET })) {
@@ -248,6 +251,31 @@ app.get(
 
 app.get('/api/media/onboarding-video', (_req, res) =>
   res.redirect(302, ONBOARDING_VIDEO_URL || publicUrl('onboarding/intro.mp4')),
+);
+
+// Supplier onboarding content from the private guide bucket
+app.get(
+  '/api/media/supplier-onboarding-video',
+  wrap(async (_req, res) => {
+    const { data, error } = await supabase.storage.from(GUIDE_BUCKET).createSignedUrl(SUPPLIER_VIDEO_PATH, 3600);
+    if (error) {
+      console.error('[guide-video]', error.message);
+      throw new HttpError(404, 'Supplier onboarding video not found');
+    }
+    res.redirect(302, data.signedUrl);
+  }),
+);
+
+app.get(
+  '/api/content/supplier-terms',
+  wrap(async (_req, res) => {
+    const { data, error } = await supabase.storage.from(GUIDE_BUCKET).download(SUPPLIER_TERMS_PATH);
+    if (error) {
+      console.error('[guide-terms]', error.message);
+      throw new HttpError(404, 'Supplier terms not found');
+    }
+    res.json({ success: true, text: await data.text() });
+  }),
 );
 
 // ---------- user ----------
