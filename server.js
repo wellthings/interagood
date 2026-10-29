@@ -27,6 +27,7 @@ const {
   RAZORPAY_KEY_SECRET,
   RAZORPAY_WEBHOOK_SECRET,
   RAZORPAY_PLAN_ID,
+  RAZORPAY_PARTNER_PLAN_ID,
 } = process.env;
 
 for (const [name, value] of Object.entries({ SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, JWT_SECRET, JWT_REFRESH_SECRET })) {
@@ -143,8 +144,11 @@ const updateUser = async (id, updates) => {
 };
 
 // ---------- razorpay ----------
-const SUPPLIER_PLAN = { key: 'interagood_supplier_219', amountPaise: 21900, totalCount: 120 };
-let cachedPlanId = RAZORPAY_PLAN_ID || null;
+const PLANS = {
+  supplier: { key: 'interagood_supplier_219', name: 'InteraGood Supplier Program', amountPaise: 21900, totalCount: 120, leadsStatus: 'deals_activated' },
+  partner: { key: 'interagood_partner_109', name: 'InteraGood Partner Program', amountPaise: 10900, totalCount: 120, leadsStatus: 'leads_activated' },
+};
+const cachedPlanIds = { supplier: RAZORPAY_PLAN_ID || null, partner: RAZORPAY_PARTNER_PLAN_ID || null };
 
 const rzp = async (method, path, body) => {
   if (!RAZORPAY_KEY_ID || !RAZORPAY_KEY_SECRET) throw new HttpError(503, 'Payments are not configured');
@@ -164,26 +168,27 @@ const rzp = async (method, path, body) => {
   return data;
 };
 
-// Monthly Rs 219 plan: uses RAZORPAY_PLAN_ID if set, otherwise finds or creates it once
-const getSupplierPlanId = async () => {
-  if (cachedPlanId) return cachedPlanId;
+// Monthly plan per role: uses the env plan id if set, otherwise finds or creates it once
+const getPlanId = async (role) => {
+  if (cachedPlanIds[role]) return cachedPlanIds[role];
+  const spec = PLANS[role];
   const list = await rzp('GET', '/plans?count=100');
-  const existing = list.items?.find((p) => p.notes?.key === SUPPLIER_PLAN.key && p.item?.amount === SUPPLIER_PLAN.amountPaise);
+  const existing = list.items?.find((p) => p.notes?.key === spec.key && p.item?.amount === spec.amountPaise);
   const plan =
     existing ||
     (await rzp('POST', '/plans', {
       period: 'monthly',
       interval: 1,
       item: {
-        name: 'InteraGood Supplier Program',
-        description: 'Monthly supplier subscription',
-        amount: SUPPLIER_PLAN.amountPaise,
+        name: spec.name,
+        description: `Monthly ${role} subscription`,
+        amount: spec.amountPaise,
         currency: 'INR',
       },
-      notes: { key: SUPPLIER_PLAN.key },
+      notes: { key: spec.key },
     }));
-  cachedPlanId = plan.id;
-  return cachedPlanId;
+  cachedPlanIds[role] = plan.id;
+  return plan.id;
 };
 
 const safeEqualHex = (a, b) => {
@@ -194,13 +199,17 @@ const safeEqualHex = (a, b) => {
 
 const hmacHex = (secret, data) => crypto.createHmac('sha256', secret).update(data).digest('hex');
 
-const activateSupplier = (id, subscriptionId) =>
-  updateUser(id, {
+const activateSubscriber = async (id, subscriptionId) => {
+  const user = await getUser(id);
+  const plan = PLANS[user.role];
+  if (!plan) throw new HttpError(403, 'No plan for this role');
+  await updateUser(id, {
     terms_accepted: true,
     is_autopay_active: true,
     autopay_mandate_id: subscriptionId,
-    leads_status: 'deals_activated',
+    leads_status: plan.leadsStatus,
   });
+};
 
 // Start of the current day in IST (UTC+5:30) as an ISO string
 const startOfTodayIST = () => {
@@ -442,36 +451,20 @@ app.patch(
   }),
 );
 
-app.post(
-  '/api/users/:uuid/onboarding',
-  auth,
-  wrap(async (req, res) => {
-    if (req.auth.role === 'supplier') throw new HttpError(403, 'Suppliers must complete onboarding through the payment flow');
-    const { terms_accepted } = parse(z.object({ terms_accepted: z.literal(true) }), req.body);
-    const mandateId = `MNDT_${crypto.randomInt(10_000_000, 100_000_000)}`;
-    await updateUser(req.params.uuid, {
-      terms_accepted,
-      is_autopay_active: true,
-      autopay_mandate_id: mandateId,
-      leads_status: req.auth.role === 'partner' ? 'leads_activated' : 'deals_activated',
-    });
-    res.json({ success: true, message: 'Onboarding completed', mandate_id: mandateId });
-  }),
-);
-
-// Supplier: creates the Rs 219/month AutoPay subscription; the first charge happens at authorization.
+// Creates the monthly AutoPay subscription for the user's role (partner Rs 109, supplier Rs 219); the first charge happens at authorization.
 // Contact and email come from the user's row, never from the client.
 app.post(
   '/api/users/:uuid/subscription',
   auth,
   wrap(async (req, res) => {
     const user = await getUser(req.params.uuid);
-    if (user.role !== 'supplier') throw new HttpError(403, 'Only suppliers can subscribe');
+    const plan = PLANS[user.role];
+    if (!plan) throw new HttpError(403, 'No plan available for this role');
     if (user.is_autopay_active) throw new HttpError(409, 'AutoPay is already active');
 
     const subscription = await rzp('POST', '/subscriptions', {
-      plan_id: await getSupplierPlanId(),
-      total_count: SUPPLIER_PLAN.totalCount,
+      plan_id: await getPlanId(user.role),
+      total_count: plan.totalCount,
       quantity: 1,
       customer_notify: 1,
       notes: { user_id: user.id },
@@ -481,7 +474,7 @@ app.post(
       success: true,
       key_id: RAZORPAY_KEY_ID,
       subscription_id: subscription.id,
-      amount: SUPPLIER_PLAN.amountPaise / 100,
+      amount: plan.amountPaise / 100,
       name: user.full_name || user.business_name || user.username,
       contact: `+91${normalizePhone(user.phone)}`,
       email: user.email,
@@ -509,7 +502,7 @@ app.post(
     if (subscription.notes?.user_id !== req.params.uuid) throw new HttpError(403, 'Subscription does not belong to this user');
     if (!['authenticated', 'active'].includes(subscription.status)) throw new HttpError(400, `Subscription is ${subscription.status}`);
 
-    await activateSupplier(req.params.uuid, subscription.id);
+    await activateSubscriber(req.params.uuid, subscription.id);
     res.json({ success: true, message: 'AutoPay activated', subscription_id: subscription.id });
   }),
 );
@@ -529,7 +522,7 @@ app.post(
     if (userId && z.string().uuid().safeParse(userId).success) {
       const event = req.body.event;
       if (['subscription.activated', 'subscription.charged'].includes(event)) {
-        await activateSupplier(userId, subscription.id);
+        await activateSubscriber(userId, subscription.id);
       } else if (['subscription.halted', 'subscription.cancelled', 'subscription.completed', 'subscription.paused'].includes(event)) {
         await updateUser(userId, { is_autopay_active: false, leads_status: 'inactive' });
       }
