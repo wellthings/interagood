@@ -20,7 +20,6 @@ const {
   CORS_ORIGIN = '*',
   STORAGE_BUCKET = 'media',
   ONBOARDING_VIDEO_URL,
-  USER_MEDIA_BUCKET = 'user_media',
   GUIDE_BUCKET = 'admin_uploads',
   SUPPLIER_VIDEO_PATH = 'instructions/supplier/supplier.mp4',
   SUPPLIER_TERMS_PATH = 'instructions/supplier/supplier.pdf',
@@ -622,18 +621,17 @@ app.post(
     if (!ext || !Buffer.isBuffer(req.body) || !req.body.length) throw new HttpError(400, 'Unsupported or empty file');
     if ((ext === 'mp4' || ext === 'mov') && kind !== 'sample') throw new HttpError(400, 'Videos allowed only for samples');
     const permanentFolder = { profile: 'profile_photo', banner: 'banner' }[kind];
-    const bucket = permanentFolder ? USER_MEDIA_BUCKET : STORAGE_BUCKET;
     const path = permanentFolder
-      ? `media/${permanentFolder}/${req.params.uuid}-${Date.now()}.${ext}`
+      ? `user_media/media/${permanentFolder}/${req.params.uuid}-${Date.now()}.${ext}`
       : `${req.params.uuid}/${kind}-${Date.now()}.${ext}`;
     const { error } = await supabase.storage
-      .from(bucket)
+      .from(STORAGE_BUCKET)
       .upload(path, req.body, { contentType: req.headers['content-type'].split(';')[0] });
     if (error) {
       console.error('[storage]', error.message);
       throw new HttpError(500, 'Upload failed');
     }
-    res.status(201).json({ success: true, url: publicUrl(path, bucket) });
+    res.status(201).json({ success: true, url: publicUrl(path) });
   }),
 );
 
