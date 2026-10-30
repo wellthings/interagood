@@ -567,7 +567,10 @@ app.post(
     if (!UPLOAD_KINDS.includes(kind)) throw new HttpError(400, 'Invalid kind');
     if (!ext || !Buffer.isBuffer(req.body) || !req.body.length) throw new HttpError(400, 'Unsupported or empty file');
     if ((ext === 'mp4' || ext === 'mov') && kind !== 'sample') throw new HttpError(400, 'Videos allowed only for samples');
-    const path = `${req.params.uuid}/${kind}-${Date.now()}.${ext}`;
+    const permanentFolder = { profile: 'profile_photo', banner: 'banner' }[kind];
+    const path = permanentFolder
+      ? `user_media/media/${permanentFolder}/${req.params.uuid}-${Date.now()}.${ext}`
+      : `${req.params.uuid}/${kind}-${Date.now()}.${ext}`;
     const { error } = await supabase.storage
       .from(STORAGE_BUCKET)
       .upload(path, req.body, { contentType: req.headers['content-type'].split(';')[0] });
