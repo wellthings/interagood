@@ -361,13 +361,16 @@ async function pdfToBlocks(buffer) {
       const bold = /bold|black|heavy|semibold/i.test(`${it.fontName} ${content.styles[it.fontName]?.fontFamily || ''}`);
       let row = rows.find((r) => Math.abs(r.y - y) < 2);
       if (!row) rows.push((row = { y, items: [] }));
-      row.items.push({ x: it.transform[4], str: it.str, size, bold });
+      row.items.push({ x: it.transform[4], w: it.width, str: it.str, size, bold });
     }
     rows.sort((a, b) => b.y - a.y);
     for (const r of rows) {
       r.items.sort((a, b) => a.x - b.x);
       lines.push({
-        text: r.items.map((i) => i.str).join('').replace(/\s+/g, ' ').trim(),
+        text: r.items
+          .map((i, k) => (k > 0 && i.x - (r.items[k - 1].x + r.items[k - 1].w) > 0.8 && !/\s$/.test(r.items[k - 1].str) ? ` ${i.str}` : i.str))
+          .join('')
+          .replace(/\s+/g, ' ').trim(),
         size: Math.max(...r.items.map((i) => i.size)),
         bold: r.items.every((i) => i.bold),
         y: r.y,
