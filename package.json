@@ -17,6 +17,7 @@
     "express-rate-limit": "^8.7.1",
     "helmet": "^8.3.0",
     "jsonwebtoken": "^9.0.3",
+    "pdfjs-dist": "^4.10.38",
     "zod": "^4.6.7"
   },
   "engines": {

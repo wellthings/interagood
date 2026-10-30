@@ -20,9 +20,10 @@ const {
   CORS_ORIGIN = '*',
   STORAGE_BUCKET = 'media',
   ONBOARDING_VIDEO_URL,
-  GUIDE_BUCKET = 'guid media',
-  SUPPLIER_VIDEO_PATH = 'video files/supplier.mp4',
-  SUPPLIER_TERMS_PATH = 'application files/suppliert&c',
+  USER_MEDIA_BUCKET = 'user_media',
+  GUIDE_BUCKET = 'admin_uploads',
+  SUPPLIER_VIDEO_PATH = 'instructions/supplier/supplier.mp4',
+  SUPPLIER_TERMS_PATH = 'instructions/supplier/supplier.pdf',
   RAZORPAY_KEY_ID,
   RAZORPAY_KEY_SECRET,
   RAZORPAY_WEBHOOK_SECRET,
@@ -42,7 +43,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 });
 
 // Public bucket holding all user uploads and the onboarding video (onboarding/intro.mp4)
-const publicUrl = (path) => supabase.storage.from(STORAGE_BUCKET).getPublicUrl(path).data.publicUrl;
+const publicUrl = (path, bucket = STORAGE_BUCKET) => supabase.storage.from(bucket).getPublicUrl(path).data.publicUrl;
 supabase.storage
   .createBucket(STORAGE_BUCKET, { public: true })
   .then(({ error }) => error && !/already exists/i.test(error.message) && console.error('[storage]', error.message));
@@ -346,6 +347,59 @@ app.get(
   }),
 );
 
+// Extracts the terms PDF into ordered blocks (title / heading / paragraph) using font size and weight
+async function pdfToBlocks(buffer) {
+  const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
+  const doc = await pdfjs.getDocument({ data: new Uint8Array(buffer), useSystemFonts: true }).promise;
+  const lines = [];
+  for (let p = 1; p <= doc.numPages; p++) {
+    const content = await (await doc.getPage(p)).getTextContent();
+    const rows = [];
+    for (const it of content.items) {
+      if (!it.str || !it.str.trim()) continue;
+      const y = it.transform[5];
+      const size = Math.abs(it.transform[3]) || it.height;
+      const bold = /bold|black|heavy|semibold/i.test(`${it.fontName} ${content.styles[it.fontName]?.fontFamily || ''}`);
+      let row = rows.find((r) => Math.abs(r.y - y) < 2);
+      if (!row) rows.push((row = { y, items: [] }));
+      row.items.push({ x: it.transform[4], str: it.str, size, bold });
+    }
+    rows.sort((a, b) => b.y - a.y);
+    for (const r of rows) {
+      r.items.sort((a, b) => a.x - b.x);
+      lines.push({
+        text: r.items.map((i) => i.str).join('').replace(/\s+/g, ' ').trim(),
+        size: Math.max(...r.items.map((i) => i.size)),
+        bold: r.items.every((i) => i.bold),
+        y: r.y,
+        page: p,
+      });
+    }
+  }
+  const freq = new Map();
+  for (const l of lines) freq.set(Math.round(l.size), (freq.get(Math.round(l.size)) || 0) + l.text.length);
+  const body = [...freq.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || 12;
+  const maxSize = Math.max(...lines.map((l) => l.size));
+  const blocks = [];
+  for (const l of lines) {
+    if (!l.text) continue;
+    const bigger = Math.round(l.size) > body;
+    const last = blocks[blocks.length - 1];
+    if (bigger && l.size >= maxSize - 0.5 && blocks.every((b) => b.type !== 'heading' && b.type !== 'paragraph')) {
+      if (last?.type === 'title') last.text += ` ${l.text}`;
+      else blocks.push({ type: 'title', text: l.text });
+    } else if (bigger || (l.bold && l.text.length <= 80)) {
+      if (last?.type === 'heading' && last.size === Math.round(l.size)) last.text += ` ${l.text}`;
+      else blocks.push({ type: 'heading', text: l.text, size: Math.round(l.size) });
+    } else if (last?.type === 'paragraph' && !/^(\d+[.)]|[-•*])\s/.test(l.text)) {
+      last.text += ` ${l.text}`;
+    } else {
+      blocks.push({ type: 'paragraph', text: l.text });
+    }
+  }
+  return blocks.map(({ type, text }) => ({ type, text }));
+}
+
 app.get(
   '/api/content/supplier-terms',
   wrap(async (_req, res) => {
@@ -354,7 +408,7 @@ app.get(
       console.error('[guide-terms]', error.message);
       throw new HttpError(404, 'Supplier terms not found');
     }
-    res.json({ success: true, text: await data.text() });
+    res.json({ success: true, blocks: await pdfToBlocks(Buffer.from(await data.arrayBuffer())) });
   }),
 );
 
@@ -568,17 +622,18 @@ app.post(
     if (!ext || !Buffer.isBuffer(req.body) || !req.body.length) throw new HttpError(400, 'Unsupported or empty file');
     if ((ext === 'mp4' || ext === 'mov') && kind !== 'sample') throw new HttpError(400, 'Videos allowed only for samples');
     const permanentFolder = { profile: 'profile_photo', banner: 'banner' }[kind];
+    const bucket = permanentFolder ? USER_MEDIA_BUCKET : STORAGE_BUCKET;
     const path = permanentFolder
-      ? `user_media/media/${permanentFolder}/${req.params.uuid}-${Date.now()}.${ext}`
+      ? `media/${permanentFolder}/${req.params.uuid}-${Date.now()}.${ext}`
       : `${req.params.uuid}/${kind}-${Date.now()}.${ext}`;
     const { error } = await supabase.storage
-      .from(STORAGE_BUCKET)
+      .from(bucket)
       .upload(path, req.body, { contentType: req.headers['content-type'].split(';')[0] });
     if (error) {
       console.error('[storage]', error.message);
       throw new HttpError(500, 'Upload failed');
     }
-    res.status(201).json({ success: true, url: publicUrl(path) });
+    res.status(201).json({ success: true, url: publicUrl(path, bucket) });
   }),
 );
 
