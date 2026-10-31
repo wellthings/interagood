@@ -22,7 +22,6 @@ const {
   ONBOARDING_VIDEO_URL,
   GUIDE_BUCKET = 'admin_uploads',
   SUPPLIER_VIDEO_PATH = 'instructions/Supplier/supplier.mp4',
-  SUPPLIER_TERMS_PATH = 'instructions/supplier/suppliert&c',
   FAST2SMS_API_KEY,
   FAST2SMS_ROUTE = 'otp',
   OTP_TTL_MINUTES = 5,
@@ -499,6 +498,7 @@ async function pdfToBlocks(buffer) {
 }
 
 // Storage paths are case-sensitive and the file extension may be omitted, so try the likely variants
+const SUPPLIER_TERMS_PATH = 'instructions/supplier/suppliert&c';
 const termsPathCandidates = () => {
   const base = SUPPLIER_TERMS_PATH;
   const swapped = base.replace(/\/(supplier)\//i, (m, s) => (s === 'supplier' ? '/Supplier/' : '/supplier/'));
