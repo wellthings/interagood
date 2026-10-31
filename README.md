@@ -21,7 +21,7 @@ npm run dev
 ## API (all under `/api`)
 Public: `GET check-availability`, `POST otp/send` (`{phone}`), `POST otp/verify` (`{phone, otp}` returns `otpToken`), `POST register` (`{role, phone, otpToken, termsAccepted: true, username, password}`; no email), `POST login`, `POST auth/refresh`, `GET categories/{partner|supplier}`, `GET age-options`, `GET media/onboarding-video` (redirects to Supabase Storage `media/onboarding/intro.mp4`, or `ONBOARDING_VIDEO_URL` if set).
 
-Phone OTP: set `FAST2SMS_API_KEY` (optional `FAST2SMS_ROUTE`, default `otp`; `OTP_TTL_MINUTES`, default 5) and run migration `20261031_004_phone_otp.sql`. OTPs go on WhatsApp through the Fast2SMS WhatsApp API when `FAST2SMS_WHATSAPP_MESSAGE_ID` and `FAST2SMS_WHATSAPP_PHONE_NUMBER_ID` are set (template variable 1 = OTP); otherwise through the Fast2SMS `bulkV2` OTP route.
+Phone OTP: set `FAST2SMS_API_KEY` and `FAST2SMS_OTP_ID` (optional `OTP_TTL_MINUTES`, default 5) and run migrations `20261031_004_phone_otp.sql` and `20261031_005_drop_phone_otps.sql`. Fast2SMS generates, delivers (WhatsApp/SMS per your panel setup) and verifies the OTP via `/dev/otp/send|resend|verify`.
 Bearer token required (token must belong to `:uuid`): `GET|DELETE users/:uuid`, `PATCH users/:uuid/{profile|business-profile|branding|status}`, `POST users/:uuid/{cancel-autopay|samples}`, `POST users/:uuid/upload?kind={profile|banner|toolbox|team|sample}` (raw image/video body, returns public URL), `DELETE users/:uuid/samples/:sampleId`.
 
 Storage: the public bucket `media` (override with `STORAGE_BUCKET`) is created automatically on startup. Upload the onboarding video to `media/onboarding/intro.mp4`.

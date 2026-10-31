@@ -23,9 +23,7 @@ const {
   GUIDE_BUCKET = 'admin_uploads',
   SUPPLIER_VIDEO_PATH = 'instructions/Supplier/supplier.mp4',
   FAST2SMS_API_KEY,
-  FAST2SMS_ROUTE = 'otp',
-  FAST2SMS_WHATSAPP_MESSAGE_ID,
-  FAST2SMS_WHATSAPP_PHONE_NUMBER_ID,
+  FAST2SMS_OTP_ID,
   OTP_TTL_MINUTES = 5,
   RAZORPAY_KEY_ID,
   RAZORPAY_KEY_SECRET,
@@ -249,10 +247,9 @@ app.get(
   }),
 );
 
-// ---------- phone OTP (Fast2SMS) ----------
+// ---------- phone OTP (Fast2SMS managed OTP: Fast2SMS generates, delivers and verifies the code) ----------
 const OTP_RESEND_SECONDS = 30;
 const OTP_MAX_SENDS_PER_HOUR = 5;
-const OTP_MAX_ATTEMPTS = 5;
 const otpLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 20, standardHeaders: true, legacyHeaders: false });
 
 const phoneSchema = z
@@ -260,32 +257,39 @@ const phoneSchema = z
   .transform(normalizePhone)
   .pipe(z.string().regex(/^[6-9]\d{9}$/, 'Enter a valid 10 digit mobile number'));
 
-const otpHash = (phone, otp) => hmacHex(JWT_SECRET, `otp:${phone}:${otp}`);
-
-// Sends the OTP on WhatsApp via an approved Fast2SMS template when message/phone ids are set, otherwise via the SMS "otp" route
-const sendOtpSms = async (phone, otp) => {
-  if (!FAST2SMS_API_KEY) throw new HttpError(503, 'OTP service is not configured');
-  const useWhatsapp = FAST2SMS_WHATSAPP_MESSAGE_ID && FAST2SMS_WHATSAPP_PHONE_NUMBER_ID;
-  const res = useWhatsapp
-    ? await fetch(
-        `https://www.fast2sms.com/dev/whatsapp?${new URLSearchParams({
-          message_id: FAST2SMS_WHATSAPP_MESSAGE_ID,
-          phone_number_id: FAST2SMS_WHATSAPP_PHONE_NUMBER_ID,
-          numbers: phone,
-          variables_values: otp,
-        })}`,
-        { headers: { authorization: FAST2SMS_API_KEY } },
-      )
-    : await fetch('https://www.fast2sms.com/dev/bulkV2', {
-        method: 'POST',
-        headers: { authorization: FAST2SMS_API_KEY, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ route: FAST2SMS_ROUTE, variables_values: otp, numbers: phone }),
-      });
+const fast2sms = async (path, body) => {
+  if (!FAST2SMS_API_KEY || !FAST2SMS_OTP_ID) throw new HttpError(503, 'OTP service is not configured');
+  const res = await fetch(`https://www.fast2sms.com/dev/otp/${path}`, {
+    method: 'POST',
+    headers: { authorization: FAST2SMS_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok || data.return === false || data.status === false) {
-    console.error('[fast2sms]', useWhatsapp ? 'whatsapp' : 'sms', res.status, data.message);
-    throw new HttpError(502, 'Could not send OTP, please try again');
+  return { ok: res.ok && data.return !== false, status: res.status, message: data.message, data };
+};
+
+// Per-phone send throttle (single backend instance)
+const otpSends = new Map();
+const checkOtpThrottle = (phone) => {
+  const now = Date.now();
+  const entry = otpSends.get(phone);
+  if (!entry) return;
+  const wait = OTP_RESEND_SECONDS - (now - entry.last) / 1000;
+  if (wait > 0) throw new HttpError(429, `Please wait ${Math.ceil(wait)}s before requesting another OTP`);
+  if (now - entry.windowStart < 3600_000 && entry.count >= OTP_MAX_SENDS_PER_HOUR) {
+    throw new HttpError(429, 'Too many OTP requests, try again after some time');
   }
+};
+const recordOtpSend = (phone) => {
+  const now = Date.now();
+  const entry = otpSends.get(phone);
+  if (entry && now - entry.windowStart < 3600_000) {
+    entry.count += 1;
+    entry.last = now;
+  } else {
+    otpSends.set(phone, { count: 1, windowStart: now, last: now });
+  }
+  if (otpSends.size > 5000) for (const [k, v] of otpSends) if (now - v.windowStart > 3600_000) otpSends.delete(k);
 };
 
 app.post(
@@ -296,34 +300,16 @@ app.post(
     if (db(await supabase.from('users').select('id').eq('phone', phone).limit(1)).length) {
       throw new HttpError(409, 'Phone already registered');
     }
+    checkOtpThrottle(phone);
 
-    const now = Date.now();
-    const prev = db(await supabase.from('phone_otps').select('*').eq('phone', phone).maybeSingle());
-    let sendCount = 1;
-    let windowStart = new Date(now).toISOString();
-    if (prev) {
-      const wait = OTP_RESEND_SECONDS - (now - new Date(prev.last_sent_at).getTime()) / 1000;
-      if (wait > 0) throw new HttpError(429, `Please wait ${Math.ceil(wait)}s before requesting another OTP`);
-      if (now - new Date(prev.window_start).getTime() < 3600_000) {
-        if (prev.send_count >= OTP_MAX_SENDS_PER_HOUR) throw new HttpError(429, 'Too many OTP requests, try again after some time');
-        sendCount = prev.send_count + 1;
-        windowStart = prev.window_start;
-      }
+    // A pending OTP for this number is re-sent, otherwise a new one is created
+    let result = otpSends.has(phone) ? await fast2sms('resend', { mobile: phone }) : null;
+    if (!result?.ok) result = await fast2sms('send', { mobile: phone, otp_id: FAST2SMS_OTP_ID, otp_length: 6, otp_expiry: Number(OTP_TTL_MINUTES) });
+    if (!result.ok) {
+      console.error('[fast2sms] send', result.status, result.message);
+      throw new HttpError(502, 'Could not send OTP, please try again');
     }
-
-    const otp = String(crypto.randomInt(100000, 1000000));
-    db(
-      await supabase.from('phone_otps').upsert({
-        phone,
-        otp_hash: otpHash(phone, otp),
-        expires_at: new Date(now + Number(OTP_TTL_MINUTES) * 60_000).toISOString(),
-        attempts: 0,
-        send_count: sendCount,
-        window_start: windowStart,
-        last_sent_at: new Date(now).toISOString(),
-      }),
-    );
-    await sendOtpSms(phone, otp);
+    recordOtpSend(phone);
     res.json({ success: true, resend_after: OTP_RESEND_SECONDS });
   }),
 );
@@ -332,15 +318,14 @@ app.post(
   '/api/otp/verify',
   otpLimiter,
   wrap(async (req, res) => {
-    const { phone, otp } = parse(z.object({ phone: phoneSchema, otp: z.string().trim().regex(/^\d{6}$/, 'OTP must be 6 digits') }), req.body);
-    const row = db(await supabase.from('phone_otps').select('*').eq('phone', phone).maybeSingle());
-    if (!row || new Date(row.expires_at) < new Date()) throw new HttpError(400, 'OTP expired, please request a new one');
-    if (row.attempts >= OTP_MAX_ATTEMPTS) throw new HttpError(429, 'Too many wrong attempts, request a new OTP');
-    if (!safeEqualHex(otpHash(phone, otp), row.otp_hash)) {
-      db(await supabase.from('phone_otps').update({ attempts: row.attempts + 1 }).eq('phone', phone));
-      throw new HttpError(400, 'Incorrect OTP');
+    const { phone, otp } = parse(z.object({ phone: phoneSchema, otp: z.string().trim().regex(/^\d{4,8}$/, 'Enter the OTP') }), req.body);
+    const result = await fast2sms('verify', { mobile: phone, otp });
+    if (!result.ok) {
+      if (result.status >= 500) throw new HttpError(502, 'Could not verify OTP, please try again');
+      console.warn('[fast2sms] verify', result.status, result.message);
+      throw new HttpError(400, 'Incorrect or expired OTP');
     }
-    db(await supabase.from('phone_otps').delete().eq('phone', phone));
+    otpSends.delete(phone);
     const otpToken = jwt.sign({ phone, typ: 'phone_verified' }, JWT_SECRET, { expiresIn: '15m' });
     res.json({ success: true, otpToken });
   }),
