@@ -28,4 +28,8 @@ Storage: the public bucket `media` (override with `STORAGE_BUCKET`) is created a
 
 Supplier onboarding: video and terms are read from the private bucket `guid media` (`GUIDE_BUCKET`, `SUPPLIER_VIDEO_PATH`; terms file `instructions/Supplier/suppliert&c` is fixed in code and may be plain text or PDF) via `GET media/supplier-onboarding-video` and `GET content/supplier-terms`.
 
+Profile menu documents: `GET content/:role/:doc` (role `supplier|partner`, doc `terms|policy|support`) serves `admin_uploads/instructions/<role>/<role><doc>` (e.g. `supplierterms`, `supplierpolicy`, `suppliersupport`; folder case and extension are ignored, plain text or PDF).
+
+Account: `POST users/:uuid/cancel-autopay` and `DELETE users/:uuid` both cancel the Razorpay subscription immediately, delete the user's files from the `media` bucket and delete the user row (samples cascade). Run migrations `20261031_006_sample_price.sql` (sample price tag: `price`, `price_unit`) and `20261031_007_sample_caption.sql` (sample `caption`; the sample name is `title`).
+
 Partner/Supplier payment (Razorpay Subscriptions, partner Rs 109/month, supplier Rs 219/month, first charge at authorization; Razorpay Checkout shows the payment methods and sets up AutoPay on pay): set `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET` (optional `RAZORPAY_PLAN_ID` for supplier and `RAZORPAY_PARTNER_PLAN_ID` for partner; otherwise the plans are found/created automatically). `POST users/:uuid/subscription` creates the subscription from the user's own phone/email, `POST users/:uuid/subscription/verify` checks the signature and activates the user. Point a Razorpay webhook to `POST /api/razorpay/webhook` with events `subscription.activated|charged|halted|cancelled|completed|paused`.

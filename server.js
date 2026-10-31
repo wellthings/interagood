@@ -533,6 +533,39 @@ app.get(
   }),
 );
 
+// Profile-menu documents (terms / policy / support) live in admin_uploads/instructions/<role>/<role><doc>.
+// Folder case and file extension may differ, so list the folder and match by name only.
+const CONTENT_ROLES = ['supplier', 'partner'];
+const CONTENT_DOCS = ['terms', 'policy', 'support'];
+const normalizeName = (s) => s.replace(/\.[^.]+$/, '').replace(/[\s_-]/g, '').toLowerCase();
+
+const findGuideFile = async (role, doc) => {
+  const want = `${role}${doc}`;
+  for (const folder of [`instructions/${role}`, `instructions/${role[0].toUpperCase()}${role.slice(1)}`]) {
+    const { data } = await supabase.storage.from(GUIDE_BUCKET).list(folder, { limit: 100 });
+    const hit = data?.find((f) => normalizeName(f.name) === want);
+    if (hit) return `${folder}/${hit.name}`;
+  }
+  return null;
+};
+
+app.get(
+  '/api/content/:role/:doc',
+  wrap(async (req, res) => {
+    const { role, doc } = req.params;
+    if (!CONTENT_ROLES.includes(role) || !CONTENT_DOCS.includes(doc)) throw new HttpError(404, 'Document not found');
+    const path = await findGuideFile(role, doc);
+    const { data: file } = path ? await supabase.storage.from(GUIDE_BUCKET).download(path) : { data: null };
+    if (!file) {
+      console.error('[guide-content] not found:', `${role}${doc}`);
+      throw new HttpError(404, 'Document not available yet');
+    }
+    const buffer = Buffer.from(await file.arrayBuffer());
+    const isPdf = buffer.subarray(0, 5).toString('latin1') === '%PDF-';
+    res.json({ success: true, blocks: isPdf ? await pdfToBlocks(buffer) : textToBlocks(buffer.toString('utf8')) });
+  }),
+);
+
 // ---------- user ----------
 const profileSchema = z.object({
   category_id: z.coerce.number().int().positive(),
@@ -697,10 +730,15 @@ app.post(
     const userId = subscription?.notes?.user_id;
     if (userId && z.string().uuid().safeParse(userId).success) {
       const event = req.body.event;
-      if (['subscription.activated', 'subscription.charged'].includes(event)) {
-        await activateSubscriber(userId, subscription.id);
-      } else if (['subscription.halted', 'subscription.cancelled', 'subscription.completed', 'subscription.paused'].includes(event)) {
-        await updateUser(userId, { is_autopay_active: false, leads_status: 'inactive' });
+      try {
+        if (['subscription.activated', 'subscription.charged'].includes(event)) {
+          await activateSubscriber(userId, subscription.id);
+        } else if (['subscription.halted', 'subscription.cancelled', 'subscription.completed', 'subscription.paused'].includes(event)) {
+          await updateUser(userId, { is_autopay_active: false, leads_status: 'inactive' });
+        }
+      } catch (err) {
+        // Events for an already deleted account must not make Razorpay retry
+        if (err.status !== 404) throw err;
       }
     }
     res.json({ success: true });
@@ -715,7 +753,7 @@ app.get(
     const samples = db(
       await supabase
         .from('user_samples')
-        .select('id, media_type, title, media_url, thumbnail_url, created_at')
+        .select(SAMPLE_COLUMNS)
         .eq('user_id', user.id)
         .order('created_at', { ascending: false }),
     );
@@ -759,11 +797,17 @@ app.post(
 );
 
 // ---------- samples (daily quota: 6 total, 3 images, 3 videos) ----------
+const SAMPLE_COLUMNS = 'id, media_type, title, caption, media_url, thumbnail_url, price, price_unit, created_at';
+const PRICE_UNITS = ['inch', 'sqfit', 'runningfit', 'pcs', 'bundle', 'combo', 'fit'];
+
 const sampleSchema = z.object({
   media_type: z.enum(['image', 'video']),
-  title: z.string().trim().max(120).optional(),
+  title: z.string().trim().min(1).max(120),
+  caption: z.string().trim().max(300).optional(),
   media_url: z.string().url(),
   thumbnail_url: z.string().url().nullish(),
+  price: z.coerce.number().positive().max(100_000_000),
+  price_unit: z.enum(PRICE_UNITS),
 });
 
 app.post(
@@ -791,11 +835,14 @@ app.post(
         .insert({
           user_id: req.params.uuid,
           media_type: body.media_type,
-          title: body.title || 'Showcase Work',
+          title: body.title,
+          caption: body.caption || null,
           media_url: body.media_url,
           thumbnail_url: body.thumbnail_url ?? null,
+          price: body.price,
+          price_unit: body.price_unit,
         })
-        .select('id, media_type, title, media_url, thumbnail_url, created_at')
+        .select(SAMPLE_COLUMNS)
         .single(),
     );
     res.status(201).json({ success: true, data: sample });
@@ -807,22 +854,71 @@ app.delete(
   auth,
   wrap(async (req, res) => {
     if (!z.string().uuid().safeParse(req.params.sampleId).success) throw new HttpError(400, 'Invalid sample id');
-    db(await supabase.from('user_samples').delete().eq('id', req.params.sampleId).eq('user_id', req.params.uuid));
+    const deleted = db(
+      await supabase.from('user_samples').delete().eq('id', req.params.sampleId).eq('user_id', req.params.uuid).select('media_url'),
+    );
+    // Best effort: remove the uploaded file too (public URL -> storage path)
+    const marker = `/object/public/${STORAGE_BUCKET}/`;
+    const paths = deleted.map((s) => s.media_url.split(marker)[1]).filter(Boolean).map(decodeURIComponent);
+    if (paths.length) {
+      const { error } = await supabase.storage.from(STORAGE_BUCKET).remove(paths);
+      if (error) console.error('[storage] sample cleanup', error.message);
+    }
     res.json({ success: true, message: 'Sample deleted' });
   }),
 );
 
 // ---------- account ----------
+const TERMINAL_SUBSCRIPTION_STATUSES = ['cancelled', 'completed', 'expired'];
+
+// Stops billing immediately. If Razorpay refuses, deletion must not continue unless the subscription is already over.
+const stopAutopay = async (user) => {
+  const id = user.autopay_mandate_id;
+  if (!id?.startsWith('sub_')) return;
+  try {
+    await rzp('POST', `/subscriptions/${encodeURIComponent(id)}/cancel`, { cancel_at_cycle_end: 0 });
+  } catch (err) {
+    const sub = await rzp('GET', `/subscriptions/${encodeURIComponent(id)}`).catch(() => null);
+    if (!sub || !TERMINAL_SUBSCRIPTION_STATUSES.includes(sub.status)) throw err;
+  }
+};
+
+// Removes every storage file of the user: <uuid>/* plus the profile photo and banner folders
+const removeUserMedia = async (userId) => {
+  const targets = [
+    { folder: userId },
+    { folder: 'user_media/media/profile_photo', search: userId },
+    { folder: 'user_media/media/banner', search: userId },
+  ];
+  for (const { folder, search } of targets) {
+    for (;;) {
+      const { data, error } = await supabase.storage.from(STORAGE_BUCKET).list(folder, { limit: 100, search });
+      if (error || !data?.length) break;
+      const files = data.filter((f) => folder === userId || f.name.includes(userId));
+      if (!files.length) break;
+      const { error: removeError } = await supabase.storage.from(STORAGE_BUCKET).remove(files.map((f) => `${folder}/${f.name}`));
+      if (removeError) {
+        console.error('[storage] account cleanup', removeError.message);
+        break;
+      }
+      if (data.length < 100) break;
+    }
+  }
+};
+
+// Cancels the subscription, deletes all uploaded files, then the user row (samples cascade)
+const deleteAccount = async (id) => {
+  const user = await getUser(id);
+  await stopAutopay(user);
+  await removeUserMedia(id);
+  db(await supabase.from('users').delete().eq('id', id));
+};
 app.post(
   '/api/users/:uuid/cancel-autopay',
   auth,
   wrap(async (req, res) => {
-    const user = await getUser(req.params.uuid);
-    if (user.autopay_mandate_id?.startsWith('sub_')) {
-      await rzp('POST', `/subscriptions/${user.autopay_mandate_id}/cancel`, { cancel_at_cycle_end: 0 });
-    }
-    await updateUser(req.params.uuid, { is_autopay_active: false, leads_status: 'cancelled' });
-    res.json({ success: true, warning: AUTOPAY_CANCEL_WARNING });
+    await deleteAccount(req.params.uuid);
+    res.json({ success: true, message: 'AutoPay cancelled and account deleted', warning: AUTOPAY_CANCEL_WARNING });
   }),
 );
 
@@ -830,7 +926,7 @@ app.delete(
   '/api/users/:uuid',
   auth,
   wrap(async (req, res) => {
-    db(await supabase.from('users').delete().eq('id', req.params.uuid));
+    await deleteAccount(req.params.uuid);
     res.json({ success: true, message: 'Account deleted' });
   }),
 );
