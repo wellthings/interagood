@@ -570,7 +570,7 @@ app.get(
     const { data: file } = path ? await supabase.storage.from(GUIDE_BUCKET).download(path) : { data: null };
     if (!file) {
       console.error('[guide-content] not found:', `${role}${doc}`, 'bucket files:', files.join(', '));
-      throw new HttpError(404, `Document not available yet [debug bucket=${GUIDE_BUCKET} files=${files.join(', ')}]`);
+      throw new HttpError(404, 'Document not available yet');
     }
     const buffer = Buffer.from(await file.arrayBuffer());
     const isPdf = buffer.subarray(0, 5).toString('latin1') === '%PDF-';
