@@ -19,7 +19,9 @@ npm run dev
 4. Generate a public domain; health check is `/health`.
 
 ## API (all under `/api`)
-Public: `GET check-availability`, `POST register`, `POST login`, `POST auth/refresh`, `GET categories/{partner|supplier}`, `GET age-options`, `GET media/onboarding-video` (redirects to Supabase Storage `media/onboarding/intro.mp4`, or `ONBOARDING_VIDEO_URL` if set).
+Public: `GET check-availability`, `POST otp/send` (`{phone}`), `POST otp/verify` (`{phone, otp}` returns `otpToken`), `POST register` (`{role, phone, otpToken, termsAccepted: true, username, password}`; no email), `POST login`, `POST auth/refresh`, `GET categories/{partner|supplier}`, `GET age-options`, `GET media/onboarding-video` (redirects to Supabase Storage `media/onboarding/intro.mp4`, or `ONBOARDING_VIDEO_URL` if set).
+
+Phone OTP: set `FAST2SMS_API_KEY` (optional `FAST2SMS_ROUTE`, default `otp`; `OTP_TTL_MINUTES`, default 5) and run migration `20261031_004_phone_otp.sql`. OTPs go through Fast2SMS `bulkV2`; enable Smart OTP in the Fast2SMS panel to deliver them on WhatsApp.
 Bearer token required (token must belong to `:uuid`): `GET|DELETE users/:uuid`, `PATCH users/:uuid/{profile|business-profile|branding|status}`, `POST users/:uuid/{cancel-autopay|samples}`, `POST users/:uuid/upload?kind={profile|banner|toolbox|team|sample}` (raw image/video body, returns public URL), `DELETE users/:uuid/samples/:sampleId`.
 
 Storage: the public bucket `media` (override with `STORAGE_BUCKET`) is created automatically on startup. Upload the onboarding video to `media/onboarding/intro.mp4`.

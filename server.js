@@ -22,7 +22,10 @@ const {
   ONBOARDING_VIDEO_URL,
   GUIDE_BUCKET = 'admin_uploads',
   SUPPLIER_VIDEO_PATH = 'instructions/Supplier/supplier.mp4',
-  SUPPLIER_TERMS_PATH = 'instructions/Supplier/supplier.pdf',
+  SUPPLIER_TERMS_PATH = 'instructions/supplier/suppliert&c',
+  FAST2SMS_API_KEY,
+  FAST2SMS_ROUTE = 'otp',
+  OTP_TTL_MINUTES = 5,
   RAZORPAY_KEY_ID,
   RAZORPAY_KEY_SECRET,
   RAZORPAY_WEBHOOK_SECRET,
@@ -245,10 +248,97 @@ app.get(
   }),
 );
 
+// ---------- phone OTP (Fast2SMS) ----------
+const OTP_RESEND_SECONDS = 30;
+const OTP_MAX_SENDS_PER_HOUR = 5;
+const OTP_MAX_ATTEMPTS = 5;
+const otpLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 20, standardHeaders: true, legacyHeaders: false });
+
+const phoneSchema = z
+  .string()
+  .transform(normalizePhone)
+  .pipe(z.string().regex(/^[6-9]\d{9}$/, 'Enter a valid 10 digit mobile number'));
+
+const otpHash = (phone, otp) => hmacHex(JWT_SECRET, `otp:${phone}:${otp}`);
+
+// Fast2SMS "otp" route; if Smart OTP is set up in the Fast2SMS panel the same call is delivered on WhatsApp
+const sendOtpSms = async (phone, otp) => {
+  if (!FAST2SMS_API_KEY) throw new HttpError(503, 'OTP service is not configured');
+  const res = await fetch('https://www.fast2sms.com/dev/bulkV2', {
+    method: 'POST',
+    headers: { authorization: FAST2SMS_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ route: FAST2SMS_ROUTE, variables_values: otp, numbers: phone }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.return === false) {
+    console.error('[fast2sms]', res.status, data.message);
+    throw new HttpError(502, 'Could not send OTP, please try again');
+  }
+};
+
+app.post(
+  '/api/otp/send',
+  otpLimiter,
+  wrap(async (req, res) => {
+    const { phone } = parse(z.object({ phone: phoneSchema }), req.body);
+    if (db(await supabase.from('users').select('id').eq('phone', phone).limit(1)).length) {
+      throw new HttpError(409, 'Phone already registered');
+    }
+
+    const now = Date.now();
+    const prev = db(await supabase.from('phone_otps').select('*').eq('phone', phone).maybeSingle());
+    let sendCount = 1;
+    let windowStart = new Date(now).toISOString();
+    if (prev) {
+      const wait = OTP_RESEND_SECONDS - (now - new Date(prev.last_sent_at).getTime()) / 1000;
+      if (wait > 0) throw new HttpError(429, `Please wait ${Math.ceil(wait)}s before requesting another OTP`);
+      if (now - new Date(prev.window_start).getTime() < 3600_000) {
+        if (prev.send_count >= OTP_MAX_SENDS_PER_HOUR) throw new HttpError(429, 'Too many OTP requests, try again after some time');
+        sendCount = prev.send_count + 1;
+        windowStart = prev.window_start;
+      }
+    }
+
+    const otp = String(crypto.randomInt(100000, 1000000));
+    db(
+      await supabase.from('phone_otps').upsert({
+        phone,
+        otp_hash: otpHash(phone, otp),
+        expires_at: new Date(now + Number(OTP_TTL_MINUTES) * 60_000).toISOString(),
+        attempts: 0,
+        send_count: sendCount,
+        window_start: windowStart,
+        last_sent_at: new Date(now).toISOString(),
+      }),
+    );
+    await sendOtpSms(phone, otp);
+    res.json({ success: true, resend_after: OTP_RESEND_SECONDS });
+  }),
+);
+
+app.post(
+  '/api/otp/verify',
+  otpLimiter,
+  wrap(async (req, res) => {
+    const { phone, otp } = parse(z.object({ phone: phoneSchema, otp: z.string().trim().regex(/^\d{6}$/, 'OTP must be 6 digits') }), req.body);
+    const row = db(await supabase.from('phone_otps').select('*').eq('phone', phone).maybeSingle());
+    if (!row || new Date(row.expires_at) < new Date()) throw new HttpError(400, 'OTP expired, please request a new one');
+    if (row.attempts >= OTP_MAX_ATTEMPTS) throw new HttpError(429, 'Too many wrong attempts, request a new OTP');
+    if (!safeEqualHex(otpHash(phone, otp), row.otp_hash)) {
+      db(await supabase.from('phone_otps').update({ attempts: row.attempts + 1 }).eq('phone', phone));
+      throw new HttpError(400, 'Incorrect OTP');
+    }
+    db(await supabase.from('phone_otps').delete().eq('phone', phone));
+    const otpToken = jwt.sign({ phone, typ: 'phone_verified' }, JWT_SECRET, { expiresIn: '15m' });
+    res.json({ success: true, otpToken });
+  }),
+);
+
 const registerSchema = z.object({
   role: z.enum(['partner', 'supplier']),
-  phone: z.string().transform(normalizePhone).pipe(z.string().length(10, 'must be 10 digits')),
-  email: z.string().trim().toLowerCase().email().max(120),
+  phone: phoneSchema,
+  otpToken: z.string().min(1, 'Verify your mobile number first'),
+  termsAccepted: z.literal(true, { error: 'Please accept the Privacy Policy and Terms & Conditions' }),
   username: z.string().trim().min(3).max(60),
   password: z.string().min(6).max(100),
 });
@@ -258,6 +348,12 @@ app.post(
   authLimiter,
   wrap(async (req, res) => {
     const body = parse(registerSchema, req.body);
+    try {
+      const payload = jwt.verify(body.otpToken, JWT_SECRET);
+      if (payload.typ !== 'phone_verified' || payload.phone !== body.phone) throw new Error();
+    } catch {
+      throw new HttpError(400, 'Mobile number is not verified, please verify with OTP');
+    }
     const user = db(
       await supabase
         .from('users')
@@ -265,9 +361,9 @@ app.post(
           id: crypto.randomUUID(),
           role: body.role,
           phone: body.phone,
-          email: body.email,
           username: body.username,
           password_hash: await bcrypt.hash(body.password, 10),
+          terms_accepted: true,
           is_online: true,
         })
         .select('id, role')
@@ -402,15 +498,29 @@ async function pdfToBlocks(buffer) {
   return blocks.map(({ type, text }) => ({ type, text }));
 }
 
+// Storage paths are case-sensitive and the file extension may be omitted, so try the likely variants
+const termsPathCandidates = () => {
+  const base = SUPPLIER_TERMS_PATH;
+  const swapped = base.replace(/\/(supplier)\//i, (m, s) => (s === 'supplier' ? '/Supplier/' : '/supplier/'));
+  return [...new Set([base, `${base}.pdf`, swapped, `${swapped}.pdf`])].filter((p) => !/\.pdf\.pdf$/i.test(p));
+};
+
 app.get(
   '/api/content/supplier-terms',
   wrap(async (_req, res) => {
-    const { data, error } = await supabase.storage.from(GUIDE_BUCKET).download(SUPPLIER_TERMS_PATH);
-    if (error) {
-      console.error('[guide-terms]', error.message);
+    let file;
+    for (const path of termsPathCandidates()) {
+      const { data } = await supabase.storage.from(GUIDE_BUCKET).download(path);
+      if (data) {
+        file = data;
+        break;
+      }
+    }
+    if (!file) {
+      console.error('[guide-terms] not found, tried:', termsPathCandidates().join(', '));
       throw new HttpError(404, 'Supplier terms not found');
     }
-    res.json({ success: true, blocks: await pdfToBlocks(Buffer.from(await data.arrayBuffer())) });
+    res.json({ success: true, blocks: await pdfToBlocks(Buffer.from(await file.arrayBuffer())) });
   }),
 );
 
