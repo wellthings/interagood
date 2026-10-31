@@ -24,6 +24,8 @@ const {
   SUPPLIER_VIDEO_PATH = 'instructions/Supplier/supplier.mp4',
   FAST2SMS_API_KEY,
   FAST2SMS_ROUTE = 'otp',
+  FAST2SMS_WHATSAPP_MESSAGE_ID,
+  FAST2SMS_WHATSAPP_PHONE_NUMBER_ID,
   OTP_TTL_MINUTES = 5,
   RAZORPAY_KEY_ID,
   RAZORPAY_KEY_SECRET,
@@ -260,17 +262,28 @@ const phoneSchema = z
 
 const otpHash = (phone, otp) => hmacHex(JWT_SECRET, `otp:${phone}:${otp}`);
 
-// Fast2SMS "otp" route; if Smart OTP is set up in the Fast2SMS panel the same call is delivered on WhatsApp
+// Sends the OTP on WhatsApp via an approved Fast2SMS template when message/phone ids are set, otherwise via the SMS "otp" route
 const sendOtpSms = async (phone, otp) => {
   if (!FAST2SMS_API_KEY) throw new HttpError(503, 'OTP service is not configured');
-  const res = await fetch('https://www.fast2sms.com/dev/bulkV2', {
-    method: 'POST',
-    headers: { authorization: FAST2SMS_API_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ route: FAST2SMS_ROUTE, variables_values: otp, numbers: phone }),
-  });
+  const useWhatsapp = FAST2SMS_WHATSAPP_MESSAGE_ID && FAST2SMS_WHATSAPP_PHONE_NUMBER_ID;
+  const res = useWhatsapp
+    ? await fetch(
+        `https://www.fast2sms.com/dev/whatsapp?${new URLSearchParams({
+          message_id: FAST2SMS_WHATSAPP_MESSAGE_ID,
+          phone_number_id: FAST2SMS_WHATSAPP_PHONE_NUMBER_ID,
+          numbers: phone,
+          variables_values: otp,
+        })}`,
+        { headers: { authorization: FAST2SMS_API_KEY } },
+      )
+    : await fetch('https://www.fast2sms.com/dev/bulkV2', {
+        method: 'POST',
+        headers: { authorization: FAST2SMS_API_KEY, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ route: FAST2SMS_ROUTE, variables_values: otp, numbers: phone }),
+      });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok || data.return === false) {
-    console.error('[fast2sms]', res.status, data.message);
+  if (!res.ok || data.return === false || data.status === false) {
+    console.error('[fast2sms]', useWhatsapp ? 'whatsapp' : 'sms', res.status, data.message);
     throw new HttpError(502, 'Could not send OTP, please try again');
   }
 };
@@ -497,8 +510,17 @@ async function pdfToBlocks(buffer) {
   return blocks.map(({ type, text }) => ({ type, text }));
 }
 
+// Plain-text terms: first line is the title, "1. Heading" lines are headings, everything else is a paragraph
+function textToBlocks(text) {
+  const lines = text.replace(/^\uFEFF/, '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  return lines.map((line, i) => ({
+    type: i === 0 ? 'title' : i === 1 || /^\d+[.)]\s/.test(line) ? 'heading' : 'paragraph',
+    text: line,
+  }));
+}
+
 // Storage paths are case-sensitive and the file extension may be omitted, so try the likely variants
-const SUPPLIER_TERMS_PATH = 'instructions/supplier/suppliert&c';
+const SUPPLIER_TERMS_PATH = 'instructions/Supplier/suppliert&c';
 const termsPathCandidates = () => {
   const base = SUPPLIER_TERMS_PATH;
   const swapped = base.replace(/\/(supplier)\//i, (m, s) => (s === 'supplier' ? '/Supplier/' : '/supplier/'));
@@ -520,7 +542,9 @@ app.get(
       console.error('[guide-terms] not found, tried:', termsPathCandidates().join(', '));
       throw new HttpError(404, 'Supplier terms not found');
     }
-    res.json({ success: true, blocks: await pdfToBlocks(Buffer.from(await file.arrayBuffer())) });
+    const buffer = Buffer.from(await file.arrayBuffer());
+    const isPdf = buffer.subarray(0, 5).toString('latin1') === '%PDF-';
+    res.json({ success: true, blocks: isPdf ? await pdfToBlocks(buffer) : textToBlocks(buffer.toString('utf8')) });
   }),
 );
 
