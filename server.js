@@ -762,12 +762,15 @@ app.get(
   auth,
   wrap(async (req, res) => {
     const user = await getUser(req.params.uuid);
-    const samples = db(
-      await supabase
-        .from('user_samples')
-        .select(SAMPLE_COLUMNS)
-        .eq('user_id', user.id)
-        .order('created_at', { ascending: false }),
+    const samples = await withVotes(
+      db(
+        await supabase
+          .from('user_samples')
+          .select(SAMPLE_COLUMNS)
+          .eq('user_id', user.id)
+          .order('created_at', { ascending: false }),
+      ),
+      user.id,
     );
     res.json({ success: true, data: { ...sanitizeUser(user), samples } });
   }),
@@ -811,6 +814,21 @@ app.post(
 // ---------- samples (daily quota: 6 total, 3 images, 3 videos) ----------
 const SAMPLE_COLUMNS = 'id, media_type, title, caption, media_url, thumbnail_url, price, price_unit, created_at';
 const PRICE_UNITS = ['inch', 'sqfit', 'runningfit', 'pcs', 'bundle', 'combo', 'fit'];
+
+// Adds likes / dislikes counts and the viewer's own vote (1, -1 or 0) to each sample
+const withVotes = async (samples, viewerId) => {
+  if (!samples.length) return samples;
+  const votes = db(await supabase.from('sample_votes').select('sample_id, user_id, vote').in('sample_id', samples.map((s) => s.id)));
+  return samples.map((s) => {
+    const own = votes.filter((v) => v.sample_id === s.id);
+    return {
+      ...s,
+      likes: own.filter((v) => v.vote === 1).length,
+      dislikes: own.filter((v) => v.vote === -1).length,
+      my_vote: own.find((v) => v.user_id === viewerId)?.vote ?? 0,
+    };
+  });
+};
 
 const sampleSchema = z.object({
   media_type: z.enum(['image', 'video']),
@@ -857,7 +875,25 @@ app.post(
         .select(SAMPLE_COLUMNS)
         .single(),
     );
-    res.status(201).json({ success: true, data: sample });
+    res.status(201).json({ success: true, data: { ...sample, likes: 0, dislikes: 0, my_vote: 0 } });
+  }),
+);
+
+app.put(
+  '/api/users/:uuid/samples/:sampleId/vote',
+  auth,
+  wrap(async (req, res) => {
+    if (!z.string().uuid().safeParse(req.params.sampleId).success) throw new HttpError(400, 'Invalid sample id');
+    const { vote } = parse(z.object({ vote: z.union([z.literal(1), z.literal(-1), z.literal(0)]) }), req.body);
+    const sample = db(await supabase.from('user_samples').select(SAMPLE_COLUMNS).eq('id', req.params.sampleId).maybeSingle());
+    if (!sample) throw new HttpError(404, 'Sample not found');
+    if (vote === 0) {
+      db(await supabase.from('sample_votes').delete().eq('sample_id', sample.id).eq('user_id', req.params.uuid));
+    } else {
+      db(await supabase.from('sample_votes').upsert({ sample_id: sample.id, user_id: req.params.uuid, vote }, { onConflict: 'sample_id,user_id' }));
+    }
+    const [{ likes, dislikes, my_vote }] = await withVotes([sample], req.params.uuid);
+    res.json({ success: true, data: { likes, dislikes, my_vote } });
   }),
 );
 
