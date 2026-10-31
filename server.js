@@ -539,14 +539,26 @@ const CONTENT_ROLES = ['supplier', 'partner'];
 const CONTENT_DOCS = ['terms', 'policy', 'support'];
 const normalizeName = (s) => s.replace(/\.[^.]+$/, '').replace(/[\s_-]/g, '').toLowerCase();
 
+// Walks the guide bucket (a few levels deep) so the folder name/case does not matter
+const listGuideFiles = async (folder = '', depth = 0, out = []) => {
+  const { data, error } = await supabase.storage.from(GUIDE_BUCKET).list(folder, { limit: 1000 });
+  if (error) {
+    console.error('[guide-list]', folder || '/', error.message);
+    return out;
+  }
+  for (const entry of data || []) {
+    const path = folder ? `${folder}/${entry.name}` : entry.name;
+    if (entry.id) out.push(path);
+    else if (depth < 4) await listGuideFiles(path, depth + 1, out);
+  }
+  return out;
+};
+
 const findGuideFile = async (role, doc) => {
   const want = `${role}${doc}`;
-  for (const folder of [`instructions/${role}`, `instructions/${role[0].toUpperCase()}${role.slice(1)}`]) {
-    const { data } = await supabase.storage.from(GUIDE_BUCKET).list(folder, { limit: 100 });
-    const hit = data?.find((f) => normalizeName(f.name) === want);
-    if (hit) return `${folder}/${hit.name}`;
-  }
-  return null;
+  const files = await listGuideFiles();
+  const hit = files.find((p) => normalizeName(p.split('/').pop()) === want);
+  return { path: hit || null, files };
 };
 
 app.get(
@@ -554,11 +566,11 @@ app.get(
   wrap(async (req, res) => {
     const { role, doc } = req.params;
     if (!CONTENT_ROLES.includes(role) || !CONTENT_DOCS.includes(doc)) throw new HttpError(404, 'Document not found');
-    const path = await findGuideFile(role, doc);
+    const { path, files } = await findGuideFile(role, doc);
     const { data: file } = path ? await supabase.storage.from(GUIDE_BUCKET).download(path) : { data: null };
     if (!file) {
-      console.error('[guide-content] not found:', `${role}${doc}`);
-      throw new HttpError(404, 'Document not available yet');
+      console.error('[guide-content] not found:', `${role}${doc}`, 'bucket files:', files.join(', '));
+      throw new HttpError(404, `Document not available yet [debug bucket=${GUIDE_BUCKET} files=${files.join(', ')}]`);
     }
     const buffer = Buffer.from(await file.arrayBuffer());
     const isPdf = buffer.subarray(0, 5).toString('latin1') === '%PDF-';
