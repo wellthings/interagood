@@ -642,7 +642,7 @@ app.post(
       total_count: plan.totalCount,
       quantity: 1,
       customer_notify: 1,
-      notes: { user_id: user.id },
+      notes: { user_id: user.id, role: user.role, phone: normalizePhone(user.phone) },
     });
 
     res.json({
@@ -652,7 +652,8 @@ app.post(
       amount: plan.amountPaise / 100,
       name: user.full_name || user.business_name || user.username,
       contact: `+91${normalizePhone(user.phone)}`,
-      email: user.email,
+      // Signup has no email; Razorpay needs one, so a per-user placeholder keeps checkout from asking for it
+      email: user.email || `${normalizePhone(user.phone)}@interagood.in`,
     });
   }),
 );
