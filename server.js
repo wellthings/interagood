@@ -796,9 +796,10 @@ app.post(
     if (!UPLOAD_KINDS.includes(kind)) throw new HttpError(400, 'Invalid kind');
     if (!ext || !Buffer.isBuffer(req.body) || !req.body.length) throw new HttpError(400, 'Unsupported or empty file');
     if ((ext === 'mp4' || ext === 'mov') && kind !== 'sample') throw new HttpError(400, 'Videos allowed only for samples');
-    const permanentFolder = { profile: 'profile_photo', banner: 'banner' }[kind];
-    const path = permanentFolder
-      ? `user_media/media/${permanentFolder}/${req.params.uuid}-${Date.now()}.${ext}`
+    const folderMap = { profile: 'profilephoto', banner: 'banner', sample: 'samples' };
+    const subFolder = folderMap[kind];
+    const path = subFolder
+      ? `media/user_media/${subFolder}/${req.params.uuid}-${Date.now()}.${ext}`
       : `${req.params.uuid}/${kind}-${Date.now()}.${ext}`;
     const { error } = await supabase.storage
       .from(STORAGE_BUCKET)
@@ -934,9 +935,9 @@ const stopAutopay = async (user) => {
 // Removes every storage file of the user: <uuid>/* plus the profile photo and banner folders
 const removeUserMedia = async (userId) => {
   const targets = [
-    { folder: userId },
-    { folder: 'user_media/media/profile_photo', search: userId },
-    { folder: 'user_media/media/banner', search: userId },
+    { folder: 'media/user_media/samples', search: userId },
+    { folder: 'media/user_media/profilephoto', search: userId },
+    { folder: 'media/user_media/banner', search: userId },
   ];
   for (const { folder, search } of targets) {
     for (;;) {
