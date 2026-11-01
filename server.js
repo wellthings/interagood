@@ -41,14 +41,14 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
 
-// Public bucket holding all user uploads: user_media/{banner,profilephoto,samples}, verification/{toolbox,team}
+// Public bucket holding all user uploads: user_media/{banner,profilephoto,samples}
 const publicUrl = (path, bucket = STORAGE_BUCKET) => supabase.storage.from(bucket).getPublicUrl(path).data.publicUrl;
 supabase.storage
   .createBucket(STORAGE_BUCKET, { public: true })
   .then(({ error }) => error && !/already exists/i.test(error.message) && console.error('[storage]', error.message));
 
 const UPLOAD_TYPES = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'video/mp4': 'mp4', 'video/quicktime': 'mov' };
-const UPLOAD_KINDS = ['profile', 'banner', 'toolbox', 'team', 'sample'];
+const UPLOAD_KINDS = ['profile', 'banner', 'sample'];
 
 const ACCESS_TTL = JWT_ACCESS_EXPIRES_IN;
 const REFRESH_TTL = JWT_REFRESH_EXPIRES_IN;
@@ -111,6 +111,21 @@ const normalizePhone = (raw) => {
 
 const escapeLike = (s) => s.replace(/[\\%_]/g, '\\$&');
 
+// Requires any valid access token (partner, supplier or the future client app); used by the card endpoints
+const authAny = (req, _res, next) => {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return next(new HttpError(401, 'Missing token'));
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    if (payload.typ !== 'access') throw new Error('wrong token type');
+    req.auth = payload;
+    next();
+  } catch {
+    next(new HttpError(401, 'Invalid or expired token'));
+  }
+};
+
 // Requires a valid access token whose subject matches :uuid
 const auth = (req, _res, next) => {
   const header = req.headers.authorization || '';
@@ -142,6 +157,16 @@ const updateUser = async (id, updates) => {
   );
   if (!rows.length) throw new HttpError(404, 'User not found');
 };
+
+// Home features (samples, online status) are only available while the subscription is active
+const assertActive = async (id) => {
+  const user = await getUser(id);
+  if (!user.is_autopay_active) throw new HttpError(402, 'Subscription is not active. Please complete the payment first.');
+};
+const requireActive = wrap(async (req, _res, next) => {
+  await assertActive(req.params.uuid);
+  next();
+});
 
 // ---------- razorpay ----------
 const PLANS = {
@@ -565,11 +590,9 @@ const businessSchema = z.object({
   banner_url: optUrl,
   age: z.coerce.number().int().min(20).max(65).nullish(),
   experience_years: z.coerce.number().int().min(4).max(20).nullish(),
-  has_toolbox: optBool,
-  toolbox_image_url: optUrl,
+  has_tools: optBool,
   has_team: optBool,
   team_members_count: z.coerce.number().int().min(0).nullish(),
-  team_image_url: optUrl,
   knows_work_completely: optBool,
   knows_measurement_system: optBool,
   can_deal_with_customers: optBool,
@@ -578,9 +601,8 @@ const businessSchema = z.object({
 });
 
 const PARTNER_ONLY_FIELDS = [
-  'age', 'experience_years', 'has_toolbox', 'toolbox_image_url', 'has_team', 'team_members_count',
-  'team_image_url', 'knows_work_completely', 'knows_measurement_system', 'can_deal_with_customers',
-  'can_manage_quotation_workflow', 'knows_pricing',
+  'age', 'experience_years', 'has_tools', 'has_team', 'team_members_count', 'knows_work_completely',
+  'knows_measurement_system', 'can_deal_with_customers', 'can_manage_quotation_workflow', 'knows_pricing',
 ];
 
 app.patch(
@@ -588,7 +610,7 @@ app.patch(
   auth,
   wrap(async (req, res) => {
     const updates = parse(businessSchema, req.body);
-    for (const key of ['profile_photo_url', 'banner_url', 'toolbox_image_url', 'team_image_url']) {
+    for (const key of ['profile_photo_url', 'banner_url']) {
       if (updates[key] === '') updates[key] = null;
     }
     // Role comes from the token, never from the request body
@@ -596,12 +618,8 @@ app.patch(
       for (const key of PARTNER_ONLY_FIELDS) updates[key] = null;
     } else {
       if (!updates.age || !updates.experience_years) throw new HttpError(400, 'Age and experience are required');
-      if (updates.has_toolbox && !updates.toolbox_image_url) throw new HttpError(400, 'Toolbox image is required');
-      if (updates.has_team && (!updates.team_image_url || !(updates.team_members_count > 0))) {
-        throw new HttpError(400, 'Team image and member count are required');
-      }
-      if (!updates.has_toolbox) updates.toolbox_image_url = null;
-      if (!updates.has_team) Object.assign(updates, { team_image_url: null, team_members_count: null });
+      if (updates.has_team && !(updates.team_members_count > 0)) throw new HttpError(400, 'Team member count is required');
+      if (!updates.has_team) updates.team_members_count = null;
     }
     await updateUser(req.params.uuid, updates);
     res.json({ success: true, message: 'Business profile saved' });
@@ -732,6 +750,7 @@ app.get(
 app.patch(
   '/api/users/:uuid/status',
   auth,
+  requireActive,
   wrap(async (req, res) => {
     const { is_online } = parse(z.object({ is_online: z.boolean() }), req.body);
     await updateUser(req.params.uuid, { is_online });
@@ -753,10 +772,8 @@ app.post(
       profile: 'user_media/profilephoto',
       banner: 'user_media/banner',
       sample: 'user_media/samples',
-      toolbox: 'verification/toolbox',
-      team: 'verification/team',
     };
-    if (['toolbox', 'team'].includes(kind) && req.auth.role !== 'partner') throw new HttpError(403, 'Only partners can upload verification images');
+    if (kind === 'sample') await assertActive(req.params.uuid);
     const path = `${folderMap[kind]}/${req.params.uuid}-${Date.now()}.${ext}`;
     const { error } = await supabase.storage
       .from(STORAGE_BUCKET)
@@ -801,6 +818,7 @@ const sampleSchema = z.object({
 app.post(
   '/api/users/:uuid/samples',
   auth,
+  requireActive,
   wrap(async (req, res) => {
     const body = parse(sampleSchema, req.body);
     const today = db(
@@ -874,6 +892,123 @@ app.delete(
   }),
 );
 
+// ---------- business cards (what a client sees in the list) ----------
+// Card JSON never contains the phone number or coordinates. They are used only on the server to build the
+// call / chat / navigation links, which the client app opens when the matching button is tapped.
+const CARD_COLUMNS =
+  'id, role, username, business_name, profile_photo_url, banner_url, category_name, is_online, is_autopay_active, latitude, longitude';
+const cardContactLimiter = rateLimit({ windowMs: 60 * 60_000, limit: 120, standardHeaders: true, legacyHeaders: false });
+
+const distanceKm = (lat1, lon1, lat2, lon2) => {
+  const rad = (d) => (d * Math.PI) / 180;
+  const a =
+    Math.sin(rad(lat2 - lat1) / 2) ** 2 + Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(rad(lon2 - lon1) / 2) ** 2;
+  return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+};
+
+const toCard = (row, from) => {
+  const { latitude, longitude, is_autopay_active, ...card } = row;
+  const hasPoint = latitude != null && longitude != null;
+  return {
+    ...card,
+    verified: is_autopay_active === true,
+    has_location: hasPoint,
+    distance_km: from && hasPoint ? Math.round(distanceKm(from.lat, from.lng, Number(latitude), Number(longitude)) * 10) / 10 : null,
+  };
+};
+
+// Only subscribed users with a finished business profile are listed
+const listableCards = () => supabase.from('users').select(CARD_COLUMNS).eq('is_autopay_active', true).not('business_name', 'is', null);
+
+const cardListQuery = z.object({
+  role: z.enum(['partner', 'supplier']).optional(),
+  category_id: z.coerce.number().int().positive().optional(),
+  q: z.string().trim().max(60).optional(),
+  lat: z.coerce.number().min(-90).max(90).optional(),
+  lng: z.coerce.number().min(-180).max(180).optional(),
+  limit: z.coerce.number().int().min(1).max(50).default(20),
+  offset: z.coerce.number().int().min(0).default(0),
+});
+
+app.get(
+  '/api/cards',
+  authAny,
+  wrap(async (req, res) => {
+    const { role, category_id, q, lat, lng, limit, offset } = parse(cardListQuery, req.query);
+    let query = listableCards();
+    if (role) query = query.eq('role', role);
+    if (category_id) query = query.eq('category_id', category_id);
+    if (q) query = query.ilike('business_name', `%${escapeLike(q)}%`);
+    const from = lat != null && lng != null ? { lat, lng } : null;
+    let cards;
+    if (from) {
+      // Nearest first: distance is computed here because coordinates are never exposed
+      const rows = db(await query.limit(500));
+      cards = rows
+        .map((r) => toCard(r, from))
+        .sort((a, b) => (a.distance_km ?? Infinity) - (b.distance_km ?? Infinity))
+        .slice(offset, offset + limit);
+    } else {
+      cards = db(await query.order('created_at', { ascending: false }).range(offset, offset + limit - 1)).map((r) => toCard(r, null));
+    }
+    res.json({ success: true, data: cards });
+  }),
+);
+
+const getCardRow = async (id) => {
+  if (!z.string().uuid().safeParse(id).success) throw new HttpError(400, 'Invalid card id');
+  const row = db(await listableCards().eq('id', id).maybeSingle());
+  if (!row) throw new HttpError(404, 'Card not found');
+  return row;
+};
+
+app.get(
+  '/api/cards/:id',
+  authAny,
+  wrap(async (req, res) => {
+    res.json({ success: true, data: toCard(await getCardRow(req.params.id), null) });
+  }),
+);
+
+// Returns the link for one card button: call -> tel:, chat -> WhatsApp, navigate -> Google Maps directions
+app.get(
+  '/api/cards/:id/contact',
+  authAny,
+  cardContactLimiter,
+  wrap(async (req, res) => {
+    const action = String(req.query.action || '');
+    if (!['call', 'chat', 'navigate'].includes(action)) throw new HttpError(400, 'Invalid action');
+    const row = await getCardRow(req.params.id);
+    if (action === 'navigate') {
+      if (row.latitude == null || row.longitude == null) throw new HttpError(404, 'Location is not available for this card');
+      return res.json({
+        success: true,
+        url: `https://www.google.com/maps/dir/?api=1&destination=${Number(row.latitude)},${Number(row.longitude)}`,
+      });
+    }
+    const { phone } = await getUser(row.id);
+    const number = `91${normalizePhone(phone)}`;
+    const url =
+      action === 'call'
+        ? `tel:+${number}`
+        : `https://wa.me/${number}?text=${encodeURIComponent(`Hello ${row.business_name}, I found you on Interagood.`)}`;
+    res.json({ success: true, url });
+  }),
+);
+
+app.get(
+  '/api/cards/:id/samples',
+  authAny,
+  wrap(async (req, res) => {
+    const row = await getCardRow(req.params.id);
+    const samples = await withVotes(
+      db(await supabase.from('user_samples').select(SAMPLE_COLUMNS).eq('user_id', row.id).order('created_at', { ascending: false })),
+      req.auth.sub,
+    );
+    res.json({ success: true, data: samples });
+  }),
+);
+
 // ---------- account ----------
 const TERMINAL_SUBSCRIPTION_STATUSES = ['cancelled', 'completed', 'expired'];
 
@@ -889,9 +1024,9 @@ const stopAutopay = async (user) => {
   }
 };
 
-// Removes every storage file of the user from the user_media and verification folders
+// Removes every storage file of the user from the user_media folders
 const removeUserMedia = async (userId) => {
-  const targets = ['user_media/samples', 'user_media/profilephoto', 'user_media/banner', 'verification/toolbox', 'verification/team'].map(
+  const targets = ['user_media/samples', 'user_media/profilephoto', 'user_media/banner'].map(
     (folder) => ({ folder, search: userId }),
   );
   for (const { folder, search } of targets) {
