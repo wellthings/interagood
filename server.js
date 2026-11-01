@@ -439,6 +439,24 @@ app.get(
   }),
 );
 
+// Partner onboarding video: instructions/<Partner|partner>/partner.mp4; folder case and extension are matched loosely
+app.get(
+  '/api/media/partner-onboarding-video',
+  wrap(async (_req, res) => {
+    const files = await listGuideFiles();
+    const videoExt = /\.(mp4|mov|webm|m4v)$/i;
+    const hit = files.find((p) => videoExt.test(p) && /^instructions\/partner\//i.test(p) && normalizeName(p.split('/').pop()) === 'partner')
+      || files.find((p) => videoExt.test(p) && /^instructions\/partner\//i.test(p));
+    if (!hit) {
+      console.error('[guide-video] partner video not found, bucket files:', files.join(', '));
+      throw new HttpError(404, 'Partner onboarding video not found');
+    }
+    const { data, error } = await supabase.storage.from(GUIDE_BUCKET).createSignedUrl(hit, 3600);
+    if (error) throw new HttpError(404, 'Partner onboarding video not found');
+    res.redirect(302, data.signedUrl);
+  }),
+);
+
 // Extracts the terms PDF into ordered blocks (title / heading / paragraph) using font size and weight
 async function pdfToBlocks(buffer) {
   const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
