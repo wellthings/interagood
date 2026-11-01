@@ -19,9 +19,7 @@ const {
   JWT_REFRESH_EXPIRES_IN = '90d',
   CORS_ORIGIN = '*',
   STORAGE_BUCKET = 'media',
-  ONBOARDING_VIDEO_URL,
   GUIDE_BUCKET = 'admin_uploads',
-  SUPPLIER_VIDEO_PATH = 'instructions/Supplier/supplier.mp4',
   FAST2SMS_API_KEY,
   FAST2SMS_OTP_ID,
   OTP_TTL_MINUTES = 5,
@@ -43,7 +41,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
 
-// Public bucket holding all user uploads and the onboarding video (onboarding/intro.mp4)
+// Public bucket holding all user uploads: user_media/{banner,profilephoto,samples}, verification/{toolbox,team}
 const publicUrl = (path, bucket = STORAGE_BUCKET) => supabase.storage.from(bucket).getPublicUrl(path).data.publicUrl;
 supabase.storage
   .createBucket(STORAGE_BUCKET, { public: true })
@@ -422,41 +420,6 @@ app.get(
   }),
 );
 
-app.get('/api/media/onboarding-video', (_req, res) =>
-  res.redirect(302, ONBOARDING_VIDEO_URL || publicUrl('onboarding/intro.mp4')),
-);
-
-// Supplier onboarding content from the private guide bucket
-app.get(
-  '/api/media/supplier-onboarding-video',
-  wrap(async (_req, res) => {
-    const { data, error } = await supabase.storage.from(GUIDE_BUCKET).createSignedUrl(SUPPLIER_VIDEO_PATH, 3600);
-    if (error) {
-      console.error('[guide-video]', error.message);
-      throw new HttpError(404, 'Supplier onboarding video not found');
-    }
-    res.redirect(302, data.signedUrl);
-  }),
-);
-
-// Partner onboarding video: instructions/<Partner|partner>/partner.mp4; folder case and extension are matched loosely
-app.get(
-  '/api/media/partner-onboarding-video',
-  wrap(async (_req, res) => {
-    const files = await listGuideFiles();
-    const videoExt = /\.(mp4|mov|webm|m4v)$/i;
-    const hit = files.find((p) => videoExt.test(p) && /^instructions\/partner\//i.test(p) && normalizeName(p.split('/').pop()) === 'partner')
-      || files.find((p) => videoExt.test(p) && /^instructions\/partner\//i.test(p));
-    if (!hit) {
-      console.error('[guide-video] partner video not found, bucket files:', files.join(', '));
-      throw new HttpError(404, 'Partner onboarding video not found');
-    }
-    const { data, error } = await supabase.storage.from(GUIDE_BUCKET).createSignedUrl(hit, 3600);
-    if (error) throw new HttpError(404, 'Partner onboarding video not found');
-    res.redirect(302, data.signedUrl);
-  }),
-);
-
 // Extracts the terms PDF into ordered blocks (title / heading / paragraph) using font size and weight
 async function pdfToBlocks(buffer) {
   const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
@@ -522,72 +485,44 @@ function textToBlocks(text) {
   }));
 }
 
-// Storage paths are case-sensitive and the file extension may be omitted, so try the likely variants
-const SUPPLIER_TERMS_PATH = 'instructions/Supplier/suppliert&c';
-const termsPathCandidates = () => {
-  const base = SUPPLIER_TERMS_PATH;
-  const swapped = base.replace(/\/(supplier)\//i, (m, s) => (s === 'supplier' ? '/Supplier/' : '/supplier/'));
-  return [...new Set([base, `${base}.pdf`, swapped, `${swapped}.pdf`])].filter((p) => !/\.pdf\.pdf$/i.test(p));
+// ---------- admin content (private bucket admin_uploads, read-only for users) ----------
+// instructions/common/terms&conditions                       -> create-account terms
+// instructions/<Partner|Supplier>/<role>.mp4                 -> onboarding video
+// instructions/<Partner|Supplier>/<role>{terms,policy,support} -> profile menu documents
+const GUIDE_FOLDERS = { common: 'common', partner: 'Partner', supplier: 'Supplier' };
+const ROLES = ['partner', 'supplier'];
+const CONTENT_DOCS = ['terms', 'policy', 'support'];
+
+const guideDocPath = (role, doc) => {
+  if (role === 'common') return doc === 'terms' ? `instructions/common/terms&conditions` : null;
+  if (!ROLES.includes(role) || !CONTENT_DOCS.includes(doc)) return null;
+  return `instructions/${GUIDE_FOLDERS[role]}/${role}${doc}`;
 };
 
 app.get(
-  '/api/content/supplier-terms',
-  wrap(async (_req, res) => {
-    let file;
-    for (const path of termsPathCandidates()) {
-      const { data } = await supabase.storage.from(GUIDE_BUCKET).download(path);
-      if (data) {
-        file = data;
-        break;
-      }
+  '/api/media/onboarding-video/:role',
+  wrap(async (req, res) => {
+    const { role } = req.params;
+    if (!ROLES.includes(role)) throw new HttpError(404, 'Video not found');
+    const path = `instructions/${GUIDE_FOLDERS[role]}/${role}.mp4`;
+    const { data, error } = await supabase.storage.from(GUIDE_BUCKET).createSignedUrl(path, 3600);
+    if (error) {
+      console.error('[guide-video]', path, error.message);
+      throw new HttpError(404, 'Onboarding video not found');
     }
-    if (!file) {
-      console.error('[guide-terms] not found, tried:', termsPathCandidates().join(', '));
-      throw new HttpError(404, 'Supplier terms not found');
-    }
-    const buffer = Buffer.from(await file.arrayBuffer());
-    const isPdf = buffer.subarray(0, 5).toString('latin1') === '%PDF-';
-    res.json({ success: true, blocks: isPdf ? await pdfToBlocks(buffer) : textToBlocks(buffer.toString('utf8')) });
+    res.redirect(302, data.signedUrl);
   }),
 );
-
-// Profile-menu documents (terms / policy / support) live in admin_uploads/instructions/<role>/<role><doc>.
-// Folder case and file extension may differ, so list the folder and match by name only.
-const CONTENT_ROLES = ['supplier', 'partner'];
-const CONTENT_DOCS = ['terms', 'policy', 'support'];
-const normalizeName = (s) => s.replace(/\.[^.]+$/, '').replace(/[\s_-]/g, '').toLowerCase();
-
-// Walks the guide bucket (a few levels deep) so the folder name/case does not matter
-const listGuideFiles = async (folder = '', depth = 0, out = []) => {
-  const { data, error } = await supabase.storage.from(GUIDE_BUCKET).list(folder, { limit: 1000 });
-  if (error) {
-    console.error('[guide-list]', folder || '/', error.message);
-    return out;
-  }
-  for (const entry of data || []) {
-    const path = folder ? `${folder}/${entry.name}` : entry.name;
-    if (entry.id) out.push(path);
-    else if (depth < 4) await listGuideFiles(path, depth + 1, out);
-  }
-  return out;
-};
-
-const findGuideFile = async (role, doc) => {
-  const want = `${role}${doc}`;
-  const files = await listGuideFiles();
-  const hit = files.find((p) => normalizeName(p.split('/').pop()) === want);
-  return { path: hit || null, files };
-};
 
 app.get(
   '/api/content/:role/:doc',
   wrap(async (req, res) => {
     const { role, doc } = req.params;
-    if (!CONTENT_ROLES.includes(role) || !CONTENT_DOCS.includes(doc)) throw new HttpError(404, 'Document not found');
-    const { path, files } = await findGuideFile(role, doc);
-    const { data: file } = path ? await supabase.storage.from(GUIDE_BUCKET).download(path) : { data: null };
+    const path = guideDocPath(role, doc);
+    if (!path) throw new HttpError(404, 'Document not found');
+    const { data: file, error } = await supabase.storage.from(GUIDE_BUCKET).download(path);
     if (!file) {
-      console.error('[guide-content] not found:', `${role}${doc}`, 'bucket files:', files.join(', '));
+      console.error('[guide-content]', path, error?.message);
       throw new HttpError(404, 'Document not available yet');
     }
     const buffer = Buffer.from(await file.arrayBuffer());
@@ -814,11 +749,15 @@ app.post(
     if (!UPLOAD_KINDS.includes(kind)) throw new HttpError(400, 'Invalid kind');
     if (!ext || !Buffer.isBuffer(req.body) || !req.body.length) throw new HttpError(400, 'Unsupported or empty file');
     if ((ext === 'mp4' || ext === 'mov') && kind !== 'sample') throw new HttpError(400, 'Videos allowed only for samples');
-    const folderMap = { profile: 'profilephoto', banner: 'banner', sample: 'samples' };
-    const subFolder = folderMap[kind];
-    const path = subFolder
-      ? `media/user_media/${subFolder}/${req.params.uuid}-${Date.now()}.${ext}`
-      : `${req.params.uuid}/${kind}-${Date.now()}.${ext}`;
+    const folderMap = {
+      profile: 'user_media/profilephoto',
+      banner: 'user_media/banner',
+      sample: 'user_media/samples',
+      toolbox: 'verification/toolbox',
+      team: 'verification/team',
+    };
+    if (['toolbox', 'team'].includes(kind) && req.auth.role !== 'partner') throw new HttpError(403, 'Only partners can upload verification images');
+    const path = `${folderMap[kind]}/${req.params.uuid}-${Date.now()}.${ext}`;
     const { error } = await supabase.storage
       .from(STORAGE_BUCKET)
       .upload(path, req.body, { contentType: req.headers['content-type'].split(';')[0] });
@@ -950,13 +889,11 @@ const stopAutopay = async (user) => {
   }
 };
 
-// Removes every storage file of the user: <uuid>/* plus the profile photo and banner folders
+// Removes every storage file of the user from the user_media and verification folders
 const removeUserMedia = async (userId) => {
-  const targets = [
-    { folder: 'media/user_media/samples', search: userId },
-    { folder: 'media/user_media/profilephoto', search: userId },
-    { folder: 'media/user_media/banner', search: userId },
-  ];
+  const targets = ['user_media/samples', 'user_media/profilephoto', 'user_media/banner', 'verification/toolbox', 'verification/team'].map(
+    (folder) => ({ folder, search: userId }),
+  );
   for (const { folder, search } of targets) {
     for (;;) {
       const { data, error } = await supabase.storage.from(STORAGE_BUCKET).list(folder, { limit: 100, search });

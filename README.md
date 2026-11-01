@@ -15,20 +15,22 @@ npm run dev
 ## Deploy on Railway
 1. Push this repo to GitHub.
 2. Railway → New Project → Deploy from GitHub repo (root directory is the repo root).
-3. Add variables: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `JWT_SECRET`, `JWT_REFRESH_SECRET` (optional: `CORS_ORIGIN`, `ONBOARDING_VIDEO_URL`).
+3. Add variables: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `JWT_SECRET`, `JWT_REFRESH_SECRET` (optional: `CORS_ORIGIN`).
 4. Generate a public domain; health check is `/health`.
 
 ## API (all under `/api`)
-Public: `GET check-availability`, `POST otp/send` (`{phone}`), `POST otp/verify` (`{phone, otp}` returns `otpToken`), `POST register` (`{role, phone, otpToken, termsAccepted: true, username, password}`; no email), `POST login`, `POST auth/refresh`, `GET categories/{partner|supplier}`, `GET age-options`, `GET media/onboarding-video` (redirects to Supabase Storage `media/onboarding/intro.mp4`, or `ONBOARDING_VIDEO_URL` if set).
+Public: `GET check-availability`, `POST otp/send` (`{phone}`), `POST otp/verify` (`{phone, otp}` returns `otpToken`), `POST register` (`{role, phone, otpToken, termsAccepted: true, username, password}`; no email), `POST login`, `POST auth/refresh`, `GET categories/{partner|supplier}`, `GET age-options`.
 
 Phone OTP: set `FAST2SMS_API_KEY` and `FAST2SMS_OTP_ID` (optional `OTP_TTL_MINUTES`, default 5) and run migrations `20261031_004_phone_otp.sql` and `20261031_005_drop_phone_otps.sql`. Fast2SMS generates, delivers (WhatsApp/SMS per your panel setup) and verifies the OTP via `/dev/otp/send|resend|verify`.
 Bearer token required (token must belong to `:uuid`): `GET|DELETE users/:uuid`, `PATCH users/:uuid/{profile|business-profile|branding|status}`, `POST users/:uuid/{cancel-autopay|samples}`, `POST users/:uuid/upload?kind={profile|banner|toolbox|team|sample}` (raw image/video body, returns public URL), `DELETE users/:uuid/samples/:sampleId`, `PUT users/:uuid/samples/:sampleId/vote` (`{vote: 1|-1|0}` like / dislike / clear, returns `{likes, dislikes, my_vote}`; `GET users/:uuid` samples include `likes`, `dislikes`, `my_vote`; needs migration `20261031_009_sample_votes.sql`).
 
-Storage: the public bucket `media` (override with `STORAGE_BUCKET`) is created automatically on startup. Upload the onboarding video to `media/onboarding/intro.mp4`.
+Storage: two buckets.
+- `media` (public, `STORAGE_BUCKET`): user uploads via `POST users/:uuid/upload?kind=...` saved as `<folder>/<uuid>-<timestamp>.<ext>`: `profile` -> `user_media/profilephoto`, `banner` -> `user_media/banner`, `sample` -> `user_media/samples`, `toolbox` -> `verification/toolbox`, `team` -> `verification/team` (toolbox/team are partner-only).
+- `admin_uploads` (private, `GUIDE_BUCKET`, admin-managed): under `instructions/`.
 
-Supplier onboarding: video and terms are read from the private bucket `guid media` (`GUIDE_BUCKET`, `SUPPLIER_VIDEO_PATH`; terms file `instructions/Supplier/suppliert&c` is fixed in code and may be plain text or PDF) via `GET media/supplier-onboarding-video` and `GET content/supplier-terms`.
+Onboarding video: `GET media/onboarding-video/:role` (`partner|supplier`) redirects to a signed URL of `instructions/<Partner|Supplier>/<role>.mp4`.
 
-Profile menu documents: `GET content/:role/:doc` (role `supplier|partner`, doc `terms|policy|support`) serves `admin_uploads/instructions/<role>/<role><doc>` (e.g. `supplierterms`, `supplierpolicy`, `suppliersupport`; folder case and extension are ignored, plain text or PDF).
+Admin documents (plain text or PDF): `GET content/:role/:doc` serves `instructions/common/terms&conditions` for `common/terms` (create-account terms), and `instructions/<Partner|Supplier>/<role><doc>` for role `partner|supplier` and doc `terms|policy|support` (e.g. `partnerterms`, `partnerpolicy`, `partnersupport`).
 
 Account: `POST users/:uuid/cancel-autopay` and `DELETE users/:uuid` both cancel the Razorpay subscription immediately, delete the user's files from the `media` bucket and delete the user row (samples cascade). Run migrations `20261031_006_sample_price.sql` (sample price tag: `price`, `price_unit`) and `20261031_007_sample_caption.sql` (sample `caption`; the sample name is `title`), then `20261031_008_fix_sample_columns.sql` (forces `caption` to varchar and `price` to numeric if the table already had those columns with other types).
 
