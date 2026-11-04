@@ -1,6 +1,6 @@
 Interagood Privacy Policy
 1. Who we are
-Interagood is a product of Wellthings. This policy explains what information we collect from Suppliers, Partners, Architects and Site Inspectors, why we collect it, and the choices you have.
+Interagood is a product of Wellthings. This policy explains what information we collect from Suppliers and Partners, why we collect it, and the choices you have.
 2. Information we collect
 - Mobile number, which you verify with a one-time password (OTP) when you sign up.
 - Username and password. Your password is stored only in a protected, encrypted form and is never visible to us.
@@ -19,7 +19,7 @@ Permissions are asked only when a feature needs them, and you can change them at
 - To process your monthly payment through our payment partner.
 - To improve Interagood and prevent misuse.
 5. Benefits to you
-Sharing accurate details helps clients find and trust you. A complete profile with good samples gives Suppliers, Partners, Architects and Site Inspectors a better chance of getting the right work.
+Sharing accurate details helps clients find and trust you. A complete profile with good samples gives Suppliers and Partners a better chance of getting the right work.
 6. Who we share it with
 We do not sell your personal information. Your business card details are visible to clients so they can contact you. We use trusted service providers only to run Interagood: SMS delivery for OTP, payment processing, and secure cloud hosting and storage. They may use your information only to provide their service to us.
 7. Payments

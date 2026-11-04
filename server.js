@@ -364,7 +364,7 @@ app.post(
   }),
 );
 
-const SIGNUP_ROLES = ['partner', 'supplier', 'architect', 'site_inspector'];
+const SIGNUP_ROLES = ['partner', 'supplier'];
 
 // Live availability check used by the website signup form (rate limited, returns only a boolean)
 app.get(
@@ -716,17 +716,6 @@ const setupSchemas = {
     knows_work_completely: z.boolean(),
     knows_pricing: z.boolean(),
     worked_with_team_before: z.boolean(),
-  }),
-  architect: z.object({
-    ...profileBase, ...ageYears,
-    education: z.string().trim().min(2).max(150),
-    design_software: z.string().trim().min(2).max(80),
-    uses_boq_tools: z.boolean(),
-  }),
-  site_inspector: z.object({
-    ...profileBase, ...ageYears,
-    has_tools: z.boolean(),
-    knows_work_completely: z.boolean(),
   }),
 };
 
