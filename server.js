@@ -1176,6 +1176,110 @@ app.get(
   }),
 );
 
+// ---------- public (logged-out website visitors) ----------
+const publicLimiter = rateLimit({ windowMs: 60_000, limit: 60, standardHeaders: true, legacyHeaders: false });
+
+const publicSupplierQuery = z.object({
+  category_ids: z
+    .string()
+    .regex(/^\d{1,3}(,\d{1,3}){0,9}$/)
+    .optional(),
+  lat: z.coerce.number().min(-90).max(90),
+  lng: z.coerce.number().min(-180).max(180),
+  max_km: z.coerce.number().min(1).max(200).default(50),
+  limit: z.coerce.number().int().min(1).max(30).default(20),
+});
+
+// Suppliers inside the client's zone (nearest first). Same card shape as /api/cards: no phone, no coordinates.
+app.get(
+  '/api/public/suppliers',
+  publicLimiter,
+  wrap(async (req, res) => {
+    const { category_ids, lat, lng, max_km, limit } = parse(publicSupplierQuery, req.query);
+    let query = listableCards().eq('users.role', 'supplier');
+    if (category_ids) query = query.in('category_id', category_ids.split(',').map(Number));
+    const from = { lat, lng };
+    const cards = db(await query.limit(500))
+      .map((r) => toCard(flatCard(r), from))
+      .filter((c) => c.distance_km != null && c.distance_km <= max_km)
+      .sort((a, b) => a.distance_km - b.distance_km)
+      .slice(0, limit);
+    res.json({ success: true, data: cards });
+  }),
+);
+
+app.get(
+  '/api/public/suppliers/:id/contact',
+  publicLimiter,
+  cardContactLimiter,
+  wrap(async (req, res) => {
+    const action = String(req.query.action || '');
+    if (!['call', 'chat', 'navigate'].includes(action)) throw new HttpError(400, 'Invalid action');
+    const row = await getCardRow(req.params.id);
+    if (row.role !== 'supplier') throw new HttpError(404, 'Card not found');
+    if (action === 'navigate') {
+      if (row.latitude == null || row.longitude == null) throw new HttpError(404, 'Location is not available for this card');
+      return res.json({ success: true, url: `https://www.google.com/maps/dir/?api=1&destination=${Number(row.latitude)},${Number(row.longitude)}` });
+    }
+    const { phone } = await getUser(row.id);
+    const number = `91${normalizePhone(phone)}`;
+    const url =
+      action === 'call'
+        ? `tel:+${number}`
+        : `https://wa.me/${number}?text=${encodeURIComponent(`Hello ${row.business_name}, I found you on Interagood.`)}`;
+    res.json({ success: true, url });
+  }),
+);
+
+app.get(
+  '/api/public/suppliers/:id/samples',
+  publicLimiter,
+  wrap(async (req, res) => {
+    const row = await getCardRow(req.params.id);
+    if (row.role !== 'supplier') throw new HttpError(404, 'Card not found');
+    const samples = db(await supabase.from('user_samples').select(SAMPLE_COLUMNS).eq('user_id', row.id).order('created_at', { ascending: false }).limit(30));
+    res.json({ success: true, data: samples });
+  }),
+);
+
+const cartRequestSchema = z.object({
+  name: z.string().trim().min(2).max(80),
+  phone: phoneSchema,
+  location_name: z.string().trim().min(2).max(200),
+  latitude: z.number().min(-90).max(90).optional(),
+  longitude: z.number().min(-180).max(180).optional(),
+  items: z
+    .array(
+      z.object({
+        category: z.string().trim().min(1).max(80),
+        module: z.string().trim().min(1).max(80),
+        mode: z.enum(['new', 'repair', 'full_interior']),
+      }),
+    )
+    .min(1)
+    .max(100),
+});
+
+// Cart submitted by a client. Stored for the admin team only; there is no public read route.
+app.post(
+  '/api/cart-requests',
+  rateLimit({ windowMs: 60 * 60_000, limit: 10, standardHeaders: true, legacyHeaders: false }),
+  wrap(async (req, res) => {
+    const b = parse(cartRequestSchema, req.body);
+    db(
+      await supabase.from('cart_requests').insert({
+        client_name: b.name,
+        client_phone: b.phone,
+        location_name: b.location_name,
+        latitude: b.latitude ?? null,
+        longitude: b.longitude ?? null,
+        items: b.items,
+      }),
+    );
+    res.status(201).json({ success: true, message: 'Request received. We will contact you soon.' });
+  }),
+);
+
 // ---------- account ----------
 const TERMINAL_SUBSCRIPTION_STATUSES = ['cancelled', 'completed', 'expired'];
 
