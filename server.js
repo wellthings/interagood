@@ -683,6 +683,86 @@ app.patch(
   }),
 );
 
+// ---------- business profile for the web signup (all four roles share the profiles table) ----------
+const IG_ID_LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+const makeIgId = () =>
+  String(100 + Math.floor(Math.random() * 900)) +
+  Array.from({ length: 4 }, () => IG_ID_LETTERS[Math.floor(Math.random() * IG_ID_LETTERS.length)]).join('');
+
+const profileBase = {
+  full_name: z.string().trim().min(2).max(120),
+  business_name: z.string().trim().min(2).max(150),
+  address: z.string().trim().min(3).max(300),
+  city: z.string().trim().min(2).max(80),
+  state: z.string().trim().min(2).max(80),
+  pincode: z.string().regex(/^\d{6}$/, 'Pincode must be 6 digits'),
+  profile_photo_url: z.string().url().nullish().or(z.literal('')),
+  banner_url: z.string().url().nullish().or(z.literal('')),
+};
+const ageYears = {
+  age: z.coerce.number().int().min(18).max(65),
+  experience_years: z.coerce.number().int().min(0).max(40),
+};
+const categoryPick = { category_id: z.coerce.number().int().positive() };
+const setupSchemas = {
+  supplier: z.object({ ...profileBase, ...categoryPick }),
+  partner: z.object({
+    ...profileBase, ...categoryPick, ...ageYears,
+    has_tools: z.boolean(),
+    has_team: z.boolean(),
+    team_members_count: z.coerce.number().int().min(0).max(500).nullish(),
+    knows_work_completely: z.boolean(),
+    knows_pricing: z.boolean(),
+    worked_with_team_before: z.boolean(),
+  }),
+  architect: z.object({
+    ...profileBase, ...ageYears,
+    education: z.string().trim().min(2).max(150),
+    design_software: z.string().trim().min(2).max(80),
+    uses_boq_tools: z.boolean(),
+  }),
+  site_inspector: z.object({
+    ...profileBase, ...ageYears,
+    has_tools: z.boolean(),
+    knows_work_completely: z.boolean(),
+  }),
+};
+
+app.post(
+  '/api/users/:uuid/profile-setup',
+  auth,
+  wrap(async (req, res) => {
+    const role = req.auth.role;
+    const schema = setupSchemas[role];
+    if (!schema) throw new HttpError(403, 'Unknown role');
+    const updates = parse(schema, req.body);
+    for (const key of ['profile_photo_url', 'banner_url']) {
+      if (!updates[key]) updates[key] = null;
+    }
+    if (updates.category_id) {
+      const table = role === 'supplier' ? 'supplier_categories' : 'partner_categories';
+      const cat = db(await supabase.from(table).select('id, name').eq('id', updates.category_id).eq('is_active', true).maybeSingle());
+      if (!cat) throw new HttpError(400, 'Invalid category');
+      updates.category_name = cat.name;
+    }
+    if (role === 'partner') {
+      if (updates.has_team && !(updates.team_members_count > 0)) throw new HttpError(400, 'Team member count is required');
+      if (!updates.has_team) updates.team_members_count = 0;
+      updates.knows_measurement_system = updates.knows_pricing;
+    }
+    const existing = db(await supabase.from('profiles').select('ig_id').eq('user_id', req.params.uuid).maybeSingle());
+    let igId = existing?.ig_id;
+    for (let attempt = 0; !igId && attempt < 10; attempt++) {
+      const candidate = makeIgId();
+      const taken = db(await supabase.from('profiles').select('user_id').eq('ig_id', candidate).maybeSingle());
+      if (!taken) igId = candidate;
+    }
+    if (!igId) throw new HttpError(500, 'Could not generate IG ID, please retry');
+    await updateUser(req.params.uuid, { ...updates, ig_id: igId });
+    res.json({ success: true, ig_id: igId });
+  }),
+);
+
 // Home-screen profile edit: only business name, photo and banner are editable
 const brandingSchema = z.object({
   business_name: z.string().trim().min(1).max(150),
