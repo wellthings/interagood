@@ -698,6 +698,8 @@ const profileBase = {
   pincode: z.string().regex(/^\d{6}$/, 'Pincode must be 6 digits'),
   profile_photo_url: z.string().url().nullish().or(z.literal('')),
   banner_url: z.string().url().nullish().or(z.literal('')),
+  latitude: z.coerce.number().min(-90).max(90).nullish(),
+  longitude: z.coerce.number().min(-180).max(180).nullish(),
 };
 const ageYears = {
   age: z.coerce.number().int().min(18).max(65),
@@ -739,6 +741,7 @@ app.post(
     for (const key of ['profile_photo_url', 'banner_url']) {
       if (!updates[key]) updates[key] = null;
     }
+    if (role === 'supplier' && !(updates.latitude && updates.longitude)) throw new HttpError(400, 'Supplier must provide shop location');
     if (updates.category_id) {
       const table = role === 'supplier' ? 'supplier_categories' : 'partner_categories';
       const cat = db(await supabase.from(table).select('id, name').eq('id', updates.category_id).eq('is_active', true).maybeSingle());
