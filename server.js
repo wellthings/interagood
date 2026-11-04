@@ -21,6 +21,8 @@ const {
   CORS_ORIGIN = '*',
   STORAGE_BUCKET = 'media',
   GUIDE_BUCKET = 'admin_uploads',
+  DOCS_BUCKET = 'verification_docs',
+  ADMIN_TOKEN,
   FAST2SMS_API_KEY,
   FAST2SMS_OTP_ID,
   OTP_TTL_MINUTES = 5,
@@ -48,8 +50,14 @@ supabase.storage
   .createBucket(STORAGE_BUCKET, { public: true })
   .then(({ error }) => error && !/already exists/i.test(error.message) && console.error('[storage]', error.message));
 
+// Private bucket for Aadhaar photos and selfies; only the admin review endpoints hand out short-lived signed links
+supabase.storage
+  .createBucket(DOCS_BUCKET, { public: false })
+  .then(({ error }) => error && !/already exists/i.test(error.message) && console.error('[storage]', error.message));
+
 const UPLOAD_TYPES = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'video/mp4': 'mp4', 'video/quicktime': 'mov' };
-const UPLOAD_KINDS = ['profile', 'banner', 'sample'];
+const UPLOAD_KINDS = ['profile', 'banner', 'sample', 'tools', 'team', 'aadhaar_front', 'aadhaar_back', 'selfie'];
+const PRIVATE_KINDS = ['aadhaar_front', 'aadhaar_back', 'selfie'];
 
 const ACCESS_TTL = JWT_ACCESS_EXPIRES_IN;
 const REFRESH_TTL = JWT_REFRESH_EXPIRES_IN;
@@ -706,12 +714,20 @@ const ageYears = {
   experience_years: z.coerce.number().int().min(0).max(40),
 };
 const categoryPick = { category_id: z.coerce.number().int().positive() };
+const verificationFields = {
+  video_call_slot: z.enum(['morning', 'afternoon', 'evening']),
+  aadhaar_front_path: z.string().min(1).max(200),
+  aadhaar_back_path: z.string().min(1).max(200),
+  selfie_path: z.string().min(1).max(200),
+};
 const setupSchemas = {
-  supplier: z.object({ ...profileBase, ...categoryPick }),
+  supplier: z.object({ ...profileBase, ...categoryPick, ...verificationFields }),
   partner: z.object({
-    ...profileBase, ...categoryPick, ...ageYears,
+    ...profileBase, ...categoryPick, ...ageYears, ...verificationFields,
     has_tools: z.boolean(),
+    tools_photo_url: z.string().url().nullish().or(z.literal('')),
     has_team: z.boolean(),
+    team_photo_url: z.string().url().nullish().or(z.literal('')),
     team_members_count: z.coerce.number().int().min(0).max(500).nullish(),
     knows_work_completely: z.boolean(),
     knows_pricing: z.boolean(),
@@ -719,6 +735,18 @@ const setupSchemas = {
   }),
 };
 
+const ensureIgId = async (userId) => {
+  const existing = db(await supabase.from('profiles').select('ig_id').eq('user_id', userId).maybeSingle());
+  if (existing?.ig_id) return existing.ig_id;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const candidate = makeIgId();
+    const taken = db(await supabase.from('profiles').select('user_id').eq('ig_id', candidate).maybeSingle());
+    if (!taken) return candidate;
+  }
+  throw new HttpError(500, 'Could not generate IG ID, please retry');
+};
+
+// The form is NOT written to profiles here. It waits in profile_submissions until an admin approves it.
 app.post(
   '/api/users/:uuid/profile-setup',
   auth,
@@ -726,31 +754,120 @@ app.post(
     const role = req.auth.role;
     const schema = setupSchemas[role];
     if (!schema) throw new HttpError(403, 'Unknown role');
-    const updates = parse(schema, req.body);
-    for (const key of ['profile_photo_url', 'banner_url']) {
-      if (!updates[key]) updates[key] = null;
+    const { video_call_slot, aadhaar_front_path, aadhaar_back_path, selfie_path, ...data } = parse(schema, req.body);
+    for (const key of ['profile_photo_url', 'banner_url', 'tools_photo_url', 'team_photo_url']) {
+      if (key in data && !data[key]) data[key] = null;
     }
-    if (role === 'supplier' && !(updates.latitude && updates.longitude)) throw new HttpError(400, 'Supplier must provide shop location');
-    if (updates.category_id) {
+    if (!data.profile_photo_url) throw new HttpError(400, 'A real profile photo is required');
+    if (role === 'supplier' && !(data.latitude && data.longitude)) throw new HttpError(400, 'Supplier must provide shop location');
+    if (data.category_id) {
       const table = role === 'supplier' ? 'supplier_categories' : 'partner_categories';
-      const cat = db(await supabase.from(table).select('id, name').eq('id', updates.category_id).eq('is_active', true).maybeSingle());
+      const cat = db(await supabase.from(table).select('id, name').eq('id', data.category_id).eq('is_active', true).maybeSingle());
       if (!cat) throw new HttpError(400, 'Invalid category');
-      updates.category_name = cat.name;
+      data.category_name = cat.name;
     }
     if (role === 'partner') {
-      if (updates.has_team && !(updates.team_members_count > 0)) throw new HttpError(400, 'Team member count is required');
-      if (!updates.has_team) updates.team_members_count = 0;
-      updates.knows_measurement_system = updates.knows_pricing;
+      if (data.has_tools && !data.tools_photo_url) throw new HttpError(400, 'Tools photo is required');
+      if (!data.has_tools) data.tools_photo_url = null;
+      if (data.has_team && !(data.team_members_count > 0)) throw new HttpError(400, 'Team member count is required');
+      if (data.has_team && !data.team_photo_url) throw new HttpError(400, 'Team photo is required');
+      if (!data.has_team) { data.team_members_count = 0; data.team_photo_url = null; }
+      data.knows_measurement_system = data.knows_pricing;
     }
-    const existing = db(await supabase.from('profiles').select('ig_id').eq('user_id', req.params.uuid).maybeSingle());
-    let igId = existing?.ig_id;
-    for (let attempt = 0; !igId && attempt < 10; attempt++) {
-      const candidate = makeIgId();
-      const taken = db(await supabase.from('profiles').select('user_id').eq('ig_id', candidate).maybeSingle());
-      if (!taken) igId = candidate;
+    const docs = { aadhaar_front_path, aadhaar_back_path, selfie_path };
+    const kinds = { aadhaar_front_path: 'aadhaar_front', aadhaar_back_path: 'aadhaar_back', selfie_path: 'selfie' };
+    for (const [key, value] of Object.entries(docs)) {
+      if (!value.startsWith(`${req.params.uuid}/${kinds[key]}-`) || value.includes('..')) {
+        throw new HttpError(400, 'Aadhaar front, Aadhaar back and a live selfie are required');
+      }
     }
-    if (!igId) throw new HttpError(500, 'Could not generate IG ID, please retry');
-    await updateUser(req.params.uuid, { ...updates, ig_id: igId });
+    const existing = db(await supabase.from('profile_submissions').select('status').eq('user_id', req.params.uuid).maybeSingle());
+    if (existing?.status === 'pending') throw new HttpError(409, 'Your profile is already under review');
+    if (existing?.status === 'approved') throw new HttpError(409, 'Your profile is already verified');
+    db(await supabase.from('profile_submissions').upsert({
+      user_id: req.params.uuid, role, data, video_call_slot, ...docs,
+      status: 'pending', rejection_reason: null, submitted_at: new Date().toISOString(), reviewed_at: null,
+    }, { onConflict: 'user_id' }));
+    res.json({ success: true, status: 'pending' });
+  }),
+);
+
+app.get(
+  '/api/users/:uuid/verification-status',
+  auth,
+  wrap(async (req, res) => {
+    const sub = db(await supabase.from('profile_submissions').select('status, rejection_reason, submitted_at').eq('user_id', req.params.uuid).maybeSingle());
+    const profile = db(await supabase.from('profiles').select('is_verified').eq('user_id', req.params.uuid).maybeSingle());
+    res.json({ success: true, status: profile?.is_verified ? 'approved' : sub?.status || 'none', rejection_reason: sub?.rejection_reason || null });
+  }),
+);
+
+// ---------- admin review (protected by the ADMIN_TOKEN environment variable) ----------
+const adminLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 100, standardHeaders: true, legacyHeaders: false });
+const adminAuth = (req, _res, next) => {
+  if (!ADMIN_TOKEN) return next(new HttpError(503, 'Admin is not configured'));
+  const given = crypto.createHash('sha256').update(String(req.get('x-admin-token') || '')).digest();
+  const want = crypto.createHash('sha256').update(ADMIN_TOKEN).digest();
+  if (!crypto.timingSafeEqual(given, want)) return next(new HttpError(401, 'Invalid admin token'));
+  next();
+};
+
+const signedDoc = async (path) => {
+  if (!path) return null;
+  const { data } = await supabase.storage.from(DOCS_BUCKET).createSignedUrl(path, 600);
+  return data?.signedUrl || null;
+};
+
+app.get(
+  '/api/admin/submissions',
+  adminLimiter,
+  adminAuth,
+  wrap(async (req, res) => {
+    const status = ['pending', 'approved', 'rejected'].includes(req.query.status) ? req.query.status : 'pending';
+    const rows = db(await supabase.from('profile_submissions').select('*').eq('status', status).order('submitted_at', { ascending: true }).limit(100));
+    const users = rows.length ? db(await supabase.from('users').select('id, phone, username').in('id', rows.map((r) => r.user_id))) : [];
+    const items = await Promise.all(rows.map(async (r) => ({
+      ...r,
+      phone: users.find((u) => u.id === r.user_id)?.phone,
+      username: users.find((u) => u.id === r.user_id)?.username,
+      aadhaar_front_url: await signedDoc(r.aadhaar_front_path),
+      aadhaar_back_url: await signedDoc(r.aadhaar_back_path),
+      selfie_url: await signedDoc(r.selfie_path),
+    })));
+    res.json({ success: true, data: items });
+  }),
+);
+
+app.post(
+  '/api/admin/submissions/:id/approve',
+  adminLimiter,
+  adminAuth,
+  wrap(async (req, res) => {
+    const sub = db(await supabase.from('profile_submissions').select('*').eq('id', req.params.id).maybeSingle());
+    if (!sub) throw new HttpError(404, 'Submission not found');
+    if (sub.status !== 'pending') throw new HttpError(409, `Submission is already ${sub.status}`);
+    const now = new Date().toISOString();
+    await updateUser(sub.user_id, {
+      ...sub.data,
+      ig_id: await ensureIgId(sub.user_id),
+      is_verified: true,
+      verified_at: now,
+    });
+    db(await supabase.from('profile_submissions').update({ status: 'approved', reviewed_at: now }).eq('id', sub.id));
+    res.json({ success: true });
+  }),
+);
+
+app.post(
+  '/api/admin/submissions/:id/reject',
+  adminLimiter,
+  adminAuth,
+  wrap(async (req, res) => {
+    const { reason } = parse(z.object({ reason: z.string().trim().min(3).max(300) }), req.body);
+    const rows = db(await supabase.from('profile_submissions')
+      .update({ status: 'rejected', rejection_reason: reason, reviewed_at: new Date().toISOString() })
+      .eq('id', req.params.id).eq('status', 'pending').select('id'));
+    if (!rows.length) throw new HttpError(404, 'Pending submission not found');
     res.json({ success: true });
   }),
 );
@@ -897,16 +1014,27 @@ app.post(
     if (!UPLOAD_KINDS.includes(kind)) throw new HttpError(400, 'Invalid kind');
     if (!ext || !Buffer.isBuffer(req.body) || !req.body.length) throw new HttpError(400, 'Unsupported or empty file');
     if ((ext === 'mp4' || ext === 'mov') && kind !== 'sample') throw new HttpError(400, 'Videos allowed only for samples');
+    if (PRIVATE_KINDS.includes(kind) && ext !== 'jpg' && ext !== 'png' && ext !== 'webp') throw new HttpError(400, 'Only images allowed');
     const folderMap = {
       profile: 'user_media/profilephoto',
       banner: 'user_media/banner',
       sample: 'user_media/samples',
+      tools: 'user_media/tools',
+      team: 'user_media/team',
     };
     if (kind === 'sample') await assertActive(req.params.uuid);
+    const contentType = req.headers['content-type'].split(';')[0];
+    if (PRIVATE_KINDS.includes(kind)) {
+      const docPath = `${req.params.uuid}/${kind}-${Date.now()}.${ext}`;
+      const { error } = await supabase.storage.from(DOCS_BUCKET).upload(docPath, req.body, { contentType });
+      if (error) {
+        console.error('[storage]', error.message);
+        throw new HttpError(500, 'Upload failed');
+      }
+      return res.status(201).json({ success: true, path: docPath });
+    }
     const path = `${folderMap[kind]}/${req.params.uuid}-${Date.now()}.${ext}`;
-    const { error } = await supabase.storage
-      .from(STORAGE_BUCKET)
-      .upload(path, req.body, { contentType: req.headers['content-type'].split(';')[0] });
+    const { error } = await supabase.storage.from(STORAGE_BUCKET).upload(path, req.body, { contentType });
     if (error) {
       console.error('[storage]', error.message);
       throw new HttpError(500, 'Upload failed');
