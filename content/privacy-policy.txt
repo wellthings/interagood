@@ -1,0 +1,36 @@
+Interagood Privacy Policy
+1. Who we are
+Interagood is a product of Wellthings. This policy explains what information we collect from Suppliers, Partners, Architects and Site Inspectors, why we collect it, and the choices you have.
+2. Information we collect
+- Mobile number, which you verify with a one-time password (OTP) when you sign up.
+- Username and password. Your password is stored only in a protected, encrypted form and is never visible to us.
+- Business profile details that you choose to add, such as your name, business name, category, address, experience, profile photo and banner.
+- Samples of your work such as photos and videos that you upload.
+- Shop or work location for Suppliers, used to show your business card to nearby clients.
+3. Permissions you may be asked for
+Permissions are asked only when a feature needs them, and you can change them at any time in your device settings.
+- Camera and photo or video access: to take or choose your profile photo, banner and work samples.
+- Location: to show your business card to clients near you.
+- Notifications: to tell you about new orders, enquiries and your monthly payment reminder.
+4. How we use your information
+- To create and verify your account and keep it secure.
+- To build your business card and show it to clients looking for your kind of work.
+- To send you orders, enquiries and important account messages.
+- To process your monthly payment through our payment partner.
+- To improve Interagood and prevent misuse.
+5. Benefits to you
+Sharing accurate details helps clients find and trust you. A complete profile with good samples gives Suppliers, Partners, Architects and Site Inspectors a better chance of getting the right work.
+6. Who we share it with
+We do not sell your personal information. Your business card details are visible to clients so they can contact you. We use trusted service providers only to run Interagood: SMS delivery for OTP, payment processing, and secure cloud hosting and storage. They may use your information only to provide their service to us.
+7. Payments
+Payments are handled by our payment partner. Interagood does not store your card, UPI or bank details.
+8. How long we keep it
+We keep your information while your account is active. When you delete your account, your profile, business card and samples are removed from Interagood, except where we must keep limited records to meet legal obligations.
+9. Your choices
+- You can edit your business profile and samples at any time in the app.
+- You can delete your account from the app.
+- You can write to us to ask what information we hold about you.
+10. Security
+We use encrypted connections, hashed passwords and access controls to protect your information. No system is completely secure, so please keep your password private.
+11. Contact
+For any privacy question, write to support@interagood.in.

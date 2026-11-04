@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -354,8 +355,27 @@ app.post(
   }),
 );
 
+const SIGNUP_ROLES = ['partner', 'supplier', 'architect', 'site_inspector'];
+
+// Live availability check used by the website signup form (rate limited, returns only a boolean)
+app.get(
+  '/api/availability',
+  otpLimiter,
+  wrap(async (req, res) => {
+    const { phone, username } = parse(
+      z.object({ phone: phoneSchema.optional(), username: z.string().trim().min(3).max(60).optional() }),
+      req.query,
+    );
+    if (!phone && !username) throw new HttpError(400, 'Provide phone or username');
+    const taken = phone
+      ? db(await supabase.from('users').select('id').eq('phone', phone).limit(1)).length > 0
+      : db(await supabase.from('users').select('id').ilike('username', escapeLike(username)).limit(1)).length > 0;
+    res.json({ success: true, available: !taken });
+  }),
+);
+
 const registerSchema = z.object({
-  role: z.enum(['partner', 'supplier']),
+  role: z.enum(SIGNUP_ROLES),
   phone: phoneSchema,
   otpToken: z.string().min(1, 'Verify your mobile number first'),
   termsAccepted: z.literal(true, { error: 'Please accept the Privacy Policy and Terms & Conditions' }),
@@ -518,8 +538,26 @@ const GUIDE_FOLDERS = { common: 'common', partner: 'Partner', supplier: 'Supplie
 const ROLES = ['partner', 'supplier'];
 const CONTENT_DOCS = ['terms', 'policy', 'support'];
 
+// Legal documents shared by all four roles. The files in ./content are uploaded to the private admin_uploads bucket
+// once, if missing, so later edits made directly in storage are never overwritten.
+const LEGAL_DOCS = {
+  terms: { path: 'instructions/common/terms&conditions', file: 'terms-and-conditions.txt' },
+  privacy: { path: 'instructions/common/privacy-policy', file: 'privacy-policy.txt' },
+};
+
+async function seedLegalDocs() {
+  const { error } = await supabase.storage.createBucket(GUIDE_BUCKET, { public: false });
+  if (error && !/already exists/i.test(error.message)) return console.error('[storage]', error.message);
+  for (const { path, file } of Object.values(LEGAL_DOCS)) {
+    const body = await readFile(new URL(`./content/${file}`, import.meta.url));
+    const { error: upErr } = await supabase.storage.from(GUIDE_BUCKET).upload(path, body, { contentType: 'text/plain; charset=utf-8', upsert: false });
+    if (upErr && !/already exists|duplicate/i.test(upErr.message)) console.error('[storage] seed', path, upErr.message);
+  }
+}
+seedLegalDocs().catch((e) => console.error('[storage] seed', e.message));
+
 const guideDocPath = (role, doc) => {
-  if (role === 'common') return doc === 'terms' ? `instructions/common/terms&conditions` : null;
+  if (role === 'common') return LEGAL_DOCS[doc]?.path ?? null;
   if (!ROLES.includes(role) || !CONTENT_DOCS.includes(doc)) return null;
   return `instructions/${GUIDE_FOLDERS[role]}/${role}${doc}`;
 };
@@ -921,7 +959,7 @@ const toCard = (row, from) => {
 const listableCards = () => supabase.from('users').select(CARD_COLUMNS).eq('is_autopay_active', true).not('business_name', 'is', null);
 
 const cardListQuery = z.object({
-  role: z.enum(['partner', 'supplier']).optional(),
+  role: z.enum(SIGNUP_ROLES).optional(),
   category_id: z.coerce.number().int().positive().optional(),
   q: z.string().trim().max(60).optional(),
   lat: z.coerce.number().min(-90).max(90).optional(),
