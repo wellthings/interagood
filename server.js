@@ -22,7 +22,6 @@ const {
   STORAGE_BUCKET = 'media',
   GUIDE_BUCKET = 'admin_uploads',
   DOCS_BUCKET = 'verification_docs',
-  ADMIN_TOKEN,
   FAST2SMS_API_KEY,
   FAST2SMS_OTP_ID,
   OTP_TTL_MINUTES = 5,
@@ -799,76 +798,6 @@ app.get(
     const sub = db(await supabase.from('profile_submissions').select('status, rejection_reason, submitted_at').eq('user_id', req.params.uuid).maybeSingle());
     const profile = db(await supabase.from('profiles').select('is_verified').eq('user_id', req.params.uuid).maybeSingle());
     res.json({ success: true, status: profile?.is_verified ? 'approved' : sub?.status || 'none', rejection_reason: sub?.rejection_reason || null });
-  }),
-);
-
-// ---------- admin review (protected by the ADMIN_TOKEN environment variable) ----------
-const adminLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 100, standardHeaders: true, legacyHeaders: false });
-const adminAuth = (req, _res, next) => {
-  if (!ADMIN_TOKEN) return next(new HttpError(503, 'Admin is not configured'));
-  const given = crypto.createHash('sha256').update(String(req.get('x-admin-token') || '')).digest();
-  const want = crypto.createHash('sha256').update(ADMIN_TOKEN).digest();
-  if (!crypto.timingSafeEqual(given, want)) return next(new HttpError(401, 'Invalid admin token'));
-  next();
-};
-
-const signedDoc = async (path) => {
-  if (!path) return null;
-  const { data } = await supabase.storage.from(DOCS_BUCKET).createSignedUrl(path, 600);
-  return data?.signedUrl || null;
-};
-
-app.get(
-  '/api/admin/submissions',
-  adminLimiter,
-  adminAuth,
-  wrap(async (req, res) => {
-    const status = ['pending', 'approved', 'rejected'].includes(req.query.status) ? req.query.status : 'pending';
-    const rows = db(await supabase.from('profile_submissions').select('*').eq('status', status).order('submitted_at', { ascending: true }).limit(100));
-    const users = rows.length ? db(await supabase.from('users').select('id, phone, username').in('id', rows.map((r) => r.user_id))) : [];
-    const items = await Promise.all(rows.map(async (r) => ({
-      ...r,
-      phone: users.find((u) => u.id === r.user_id)?.phone,
-      username: users.find((u) => u.id === r.user_id)?.username,
-      aadhaar_front_url: await signedDoc(r.aadhaar_front_path),
-      aadhaar_back_url: await signedDoc(r.aadhaar_back_path),
-      selfie_url: await signedDoc(r.selfie_path),
-    })));
-    res.json({ success: true, data: items });
-  }),
-);
-
-app.post(
-  '/api/admin/submissions/:id/approve',
-  adminLimiter,
-  adminAuth,
-  wrap(async (req, res) => {
-    const sub = db(await supabase.from('profile_submissions').select('*').eq('id', req.params.id).maybeSingle());
-    if (!sub) throw new HttpError(404, 'Submission not found');
-    if (sub.status !== 'pending') throw new HttpError(409, `Submission is already ${sub.status}`);
-    const now = new Date().toISOString();
-    await updateUser(sub.user_id, {
-      ...sub.data,
-      ig_id: await ensureIgId(sub.user_id),
-      is_verified: true,
-      verified_at: now,
-    });
-    db(await supabase.from('profile_submissions').update({ status: 'approved', reviewed_at: now }).eq('id', sub.id));
-    res.json({ success: true });
-  }),
-);
-
-app.post(
-  '/api/admin/submissions/:id/reject',
-  adminLimiter,
-  adminAuth,
-  wrap(async (req, res) => {
-    const { reason } = parse(z.object({ reason: z.string().trim().min(3).max(300) }), req.body);
-    const rows = db(await supabase.from('profile_submissions')
-      .update({ status: 'rejected', rejection_reason: reason, reviewed_at: new Date().toISOString() })
-      .eq('id', req.params.id).eq('status', 'pending').select('id'));
-    if (!rows.length) throw new HttpError(404, 'Pending submission not found');
-    res.json({ success: true });
   }),
 );
 
