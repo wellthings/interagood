@@ -762,7 +762,7 @@ app.post(
     }
     if (!igId) throw new HttpError(500, 'Could not generate IG ID, please retry');
     await updateUser(req.params.uuid, { ...updates, ig_id: igId });
-    res.json({ success: true, ig_id: igId });
+    res.json({ success: true });
   }),
 );
 
