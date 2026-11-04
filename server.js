@@ -146,17 +146,26 @@ const auth = (req, _res, next) => {
 // Coordinates stay in the DB only and are never sent to the app
 const sanitizeUser = ({ password_hash, latitude, longitude, ...rest }) => rest;
 
+// users holds only login identity; everything else lives in profiles (one row per user).
+// getUser/updateUser present both as one object so the rest of the API stays unchanged.
+const IDENTITY_COLUMNS = ['role', 'phone', 'username', 'password_hash'];
+
 const getUser = async (id) => {
   const user = db(await supabase.from('users').select('*').eq('id', id).maybeSingle());
   if (!user) throw new HttpError(404, 'User not found');
-  return user;
+  const { user_id, ...profile } = db(await supabase.from('profiles').select('*').eq('user_id', id).maybeSingle()) || {};
+  return { ...profile, ...user };
 };
 
 const updateUser = async (id, updates) => {
-  const rows = db(
-    await supabase.from('users').update({ ...updates, updated_at: new Date().toISOString() }).eq('id', id).select('id'),
-  );
+  const now = new Date().toISOString();
+  const identity = Object.fromEntries(Object.entries(updates).filter(([k]) => IDENTITY_COLUMNS.includes(k)));
+  const profile = Object.fromEntries(Object.entries(updates).filter(([k]) => !IDENTITY_COLUMNS.includes(k)));
+  const rows = db(await supabase.from('users').update({ ...identity, updated_at: now }).eq('id', id).select('id'));
   if (!rows.length) throw new HttpError(404, 'User not found');
+  if (Object.keys(profile).length) {
+    db(await supabase.from('profiles').upsert({ user_id: id, ...profile, updated_at: now }, { onConflict: 'user_id' }));
+  }
 };
 
 // Home features (samples, online status) are only available while the subscription is active
@@ -264,7 +273,7 @@ app.get(
       (field === 'username' && value.length >= 3);
     if (!valid) return res.json({ field, value, available: false });
 
-    let query = supabase.from('users').select('id').limit(1);
+    let query = field === 'email' ? supabase.from('profiles').select('user_id').limit(1) : supabase.from('users').select('id').limit(1);
     query = field === 'phone' ? query.eq('phone', value) : query.ilike(field, escapeLike(value));
     const rows = db(await query);
     res.json({ field, value, available: rows.length === 0 });
@@ -403,12 +412,16 @@ app.post(
           phone: body.phone,
           username: body.username,
           password_hash: await bcrypt.hash(body.password, 10),
-          terms_accepted: true,
-          is_online: true,
         })
         .select('id, role')
         .single(),
     );
+    const { error: profileError } = await supabase.from('profiles').insert({ user_id: user.id, terms_accepted: true });
+    if (profileError) {
+      await supabase.from('users').delete().eq('id', user.id);
+      console.error('[supabase]', profileError);
+      throw new HttpError(500, 'Database error');
+    }
     res.status(201).json({ success: true, uuid: user.id, role: user.role, ...signTokens(user) });
   }),
 );
@@ -422,7 +435,13 @@ app.post(
     const { identifier, password } = parse(loginSchema, req.body);
     const column = identifier.includes('@') ? 'email' : /^[\d+\s-]{10,}$/.test(identifier) ? 'phone' : 'username';
     const value = column === 'phone' ? normalizePhone(identifier) : identifier;
-    const user = db(await supabase.from('users').select('*').ilike(column, escapeLike(value)).maybeSingle());
+    let user;
+    if (column === 'email') {
+      const profile = db(await supabase.from('profiles').select('user_id').ilike('email', escapeLike(value)).maybeSingle());
+      user = profile && db(await supabase.from('users').select('*').eq('id', profile.user_id).maybeSingle());
+    } else {
+      user = db(await supabase.from('users').select('*').ilike(column, escapeLike(value)).maybeSingle());
+    }
     if (!user || !(await bcrypt.compare(password, user.password_hash))) {
       throw new HttpError(401, 'Invalid credentials');
     }
@@ -934,7 +953,8 @@ app.delete(
 // Card JSON never contains the phone number or coordinates. They are used only on the server to build the
 // call / chat / navigation links, which the client app opens when the matching button is tapped.
 const CARD_COLUMNS =
-  'id, role, username, business_name, profile_photo_url, banner_url, category_name, is_online, is_autopay_active, latitude, longitude';
+  'user_id, business_name, profile_photo_url, banner_url, category_name, is_online, is_autopay_active, latitude, longitude, created_at, users!inner(role, username)';
+const flatCard = ({ user_id, users, created_at, ...rest }) => ({ id: user_id, role: users.role, username: users.username, ...rest });
 const cardContactLimiter = rateLimit({ windowMs: 60 * 60_000, limit: 120, standardHeaders: true, legacyHeaders: false });
 
 const distanceKm = (lat1, lon1, lat2, lon2) => {
@@ -945,7 +965,7 @@ const distanceKm = (lat1, lon1, lat2, lon2) => {
 };
 
 const toCard = (row, from) => {
-  const { latitude, longitude, is_autopay_active, ...card } = row;
+  const { created_at, latitude, longitude, is_autopay_active, ...card } = row;
   const hasPoint = latitude != null && longitude != null;
   return {
     ...card,
@@ -956,7 +976,7 @@ const toCard = (row, from) => {
 };
 
 // Only subscribed users with a finished business profile are listed
-const listableCards = () => supabase.from('users').select(CARD_COLUMNS).eq('is_autopay_active', true).not('business_name', 'is', null);
+const listableCards = () => supabase.from('profiles').select(CARD_COLUMNS).eq('is_autopay_active', true).not('business_name', 'is', null);
 
 const cardListQuery = z.object({
   role: z.enum(SIGNUP_ROLES).optional(),
@@ -974,7 +994,7 @@ app.get(
   wrap(async (req, res) => {
     const { role, category_id, q, lat, lng, limit, offset } = parse(cardListQuery, req.query);
     let query = listableCards();
-    if (role) query = query.eq('role', role);
+    if (role) query = query.eq('users.role', role);
     if (category_id) query = query.eq('category_id', category_id);
     if (q) query = query.ilike('business_name', `%${escapeLike(q)}%`);
     const from = lat != null && lng != null ? { lat, lng } : null;
@@ -983,11 +1003,11 @@ app.get(
       // Nearest first: distance is computed here because coordinates are never exposed
       const rows = db(await query.limit(500));
       cards = rows
-        .map((r) => toCard(r, from))
+        .map((r) => toCard(flatCard(r), from))
         .sort((a, b) => (a.distance_km ?? Infinity) - (b.distance_km ?? Infinity))
         .slice(offset, offset + limit);
     } else {
-      cards = db(await query.order('created_at', { ascending: false }).range(offset, offset + limit - 1)).map((r) => toCard(r, null));
+      cards = db(await query.order('created_at', { ascending: false }).range(offset, offset + limit - 1)).map((r) => toCard(flatCard(r), null));
     }
     res.json({ success: true, data: cards });
   }),
@@ -995,9 +1015,9 @@ app.get(
 
 const getCardRow = async (id) => {
   if (!z.string().uuid().safeParse(id).success) throw new HttpError(400, 'Invalid card id');
-  const row = db(await listableCards().eq('id', id).maybeSingle());
+  const row = db(await listableCards().eq('user_id', id).maybeSingle());
   if (!row) throw new HttpError(404, 'Card not found');
-  return row;
+  return flatCard(row);
 };
 
 app.get(
