@@ -21,7 +21,6 @@ const {
   CORS_ORIGIN = '*',
   STORAGE_BUCKET = 'media',
   GUIDE_BUCKET = 'admin_uploads',
-  DOCS_BUCKET = 'verification_docs',
   FAST2SMS_API_KEY,
   FAST2SMS_OTP_ID,
   OTP_TTL_MINUTES = 5,
@@ -49,14 +48,8 @@ supabase.storage
   .createBucket(STORAGE_BUCKET, { public: true })
   .then(({ error }) => error && !/already exists/i.test(error.message) && console.error('[storage]', error.message));
 
-// Private bucket for Aadhaar photos and selfies; only the admin review endpoints hand out short-lived signed links
-supabase.storage
-  .createBucket(DOCS_BUCKET, { public: false })
-  .then(({ error }) => error && !/already exists/i.test(error.message) && console.error('[storage]', error.message));
-
 const UPLOAD_TYPES = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'video/mp4': 'mp4', 'video/quicktime': 'mov' };
-const UPLOAD_KINDS = ['profile', 'banner', 'sample', 'tools', 'team', 'aadhaar_front', 'aadhaar_back', 'selfie'];
-const PRIVATE_KINDS = ['aadhaar_front', 'aadhaar_back', 'selfie'];
+const UPLOAD_KINDS = ['profile', 'banner', 'sample', 'tools', 'team'];
 
 const ACCESS_TTL = JWT_ACCESS_EXPIRES_IN;
 const REFRESH_TTL = JWT_REFRESH_EXPIRES_IN;
@@ -245,11 +238,17 @@ const activateSubscriber = async (id, subscriptionId) => {
   const user = await getUser(id);
   const plan = PLANS[user.role];
   if (!plan) throw new HttpError(403, 'No plan for this role');
+  const now = new Date();
+  const nextDue = new Date(now);
+  nextDue.setMonth(nextDue.getMonth() + 1);
   await updateUser(id, {
     terms_accepted: true,
     is_autopay_active: true,
     autopay_mandate_id: subscriptionId,
     leads_status: plan.leadsStatus,
+    payment_status: 'paid',
+    last_paid_at: now.toISOString(),
+    next_due_at: nextDue.toISOString(),
   });
 };
 
@@ -713,16 +712,10 @@ const ageYears = {
   experience_years: z.coerce.number().int().min(0).max(40),
 };
 const categoryPick = { category_id: z.coerce.number().int().positive() };
-const verificationFields = {
-  video_call_slot: z.enum(['morning', 'afternoon', 'evening']),
-  aadhaar_front_path: z.string().min(1).max(200),
-  aadhaar_back_path: z.string().min(1).max(200),
-  selfie_path: z.string().min(1).max(200),
-};
 const setupSchemas = {
-  supplier: z.object({ ...profileBase, ...categoryPick, ...verificationFields }),
+  supplier: z.object({ ...profileBase, ...categoryPick }),
   partner: z.object({
-    ...profileBase, ...categoryPick, ...ageYears, ...verificationFields,
+    ...profileBase, ...categoryPick, ...ageYears,
     has_tools: z.boolean(),
     tools_photo_url: z.string().url().nullish().or(z.literal('')),
     has_team: z.boolean(),
@@ -745,7 +738,7 @@ const ensureIgId = async (userId) => {
   throw new HttpError(500, 'Could not generate IG ID, please retry');
 };
 
-// The form is NOT written to profiles here. It waits in profile_submissions until an admin approves it.
+// Saves the business profile directly and returns the data shown on the onboarding business card
 app.post(
   '/api/users/:uuid/profile-setup',
   auth,
@@ -753,11 +746,10 @@ app.post(
     const role = req.auth.role;
     const schema = setupSchemas[role];
     if (!schema) throw new HttpError(403, 'Unknown role');
-    const { video_call_slot, aadhaar_front_path, aadhaar_back_path, selfie_path, ...data } = parse(schema, req.body);
+    const data = parse(schema, req.body);
     for (const key of ['profile_photo_url', 'banner_url', 'tools_photo_url', 'team_photo_url']) {
       if (key in data && !data[key]) data[key] = null;
     }
-    if (!data.profile_photo_url) throw new HttpError(400, 'A real profile photo is required');
     if (role === 'supplier' && !(data.latitude && data.longitude)) throw new HttpError(400, 'Supplier must provide shop location');
     if (data.category_id) {
       const table = role === 'supplier' ? 'supplier_categories' : 'partner_categories';
@@ -773,31 +765,25 @@ app.post(
       if (!data.has_team) { data.team_members_count = 0; data.team_photo_url = null; }
       data.knows_measurement_system = data.knows_pricing;
     }
-    const docs = { aadhaar_front_path, aadhaar_back_path, selfie_path };
-    const kinds = { aadhaar_front_path: 'aadhaar_front', aadhaar_back_path: 'aadhaar_back', selfie_path: 'selfie' };
-    for (const [key, value] of Object.entries(docs)) {
-      if (!value.startsWith(`${req.params.uuid}/${kinds[key]}-`) || value.includes('..')) {
-        throw new HttpError(400, 'Aadhaar front, Aadhaar back and a live selfie are required');
-      }
-    }
-    const existing = db(await supabase.from('profile_submissions').select('status').eq('user_id', req.params.uuid).maybeSingle());
-    if (existing?.status === 'pending') throw new HttpError(409, 'Your profile is already under review');
-    if (existing?.status === 'approved') throw new HttpError(409, 'Your profile is already verified');
-    db(await supabase.from('profile_submissions').upsert({
-      user_id: req.params.uuid, role, data, video_call_slot, ...docs,
-      status: 'pending', rejection_reason: null, submitted_at: new Date().toISOString(), reviewed_at: null,
-    }, { onConflict: 'user_id' }));
-    res.json({ success: true, status: 'pending' });
-  }),
-);
-
-app.get(
-  '/api/users/:uuid/verification-status',
-  auth,
-  wrap(async (req, res) => {
-    const sub = db(await supabase.from('profile_submissions').select('status, rejection_reason, submitted_at').eq('user_id', req.params.uuid).maybeSingle());
-    const profile = db(await supabase.from('profiles').select('is_verified').eq('user_id', req.params.uuid).maybeSingle());
-    res.json({ success: true, status: profile?.is_verified ? 'approved' : sub?.status || 'none', rejection_reason: sub?.rejection_reason || null });
+    const igId = await ensureIgId(req.params.uuid);
+    await updateUser(req.params.uuid, { ...data, ig_id: igId });
+    const user = await getUser(req.params.uuid);
+    res.json({
+      success: true,
+      card: {
+        business_name: user.business_name,
+        username: user.username,
+        ig_id: user.ig_id,
+        role: user.role,
+        category_name: user.category_name,
+        address: [user.address, user.city, user.state, user.pincode].filter(Boolean).join(', '),
+        profile_photo_url: user.profile_photo_url,
+        banner_url: user.banner_url,
+        is_online: !!user.is_online,
+        payment_status: user.payment_status,
+        amount: PLANS[user.role].amountPaise / 100,
+      },
+    });
   }),
 );
 
@@ -892,7 +878,11 @@ app.post(
         if (['subscription.activated', 'subscription.charged'].includes(event)) {
           await activateSubscriber(userId, subscription.id);
         } else if (['subscription.halted', 'subscription.cancelled', 'subscription.completed', 'subscription.paused'].includes(event)) {
-          await updateUser(userId, { is_autopay_active: false, leads_status: 'inactive' });
+          await updateUser(userId, {
+            is_autopay_active: false,
+            leads_status: 'inactive',
+            payment_status: event === 'subscription.halted' ? 'failed' : 'cancelled',
+          });
         }
       } catch (err) {
         // Events for an already deleted account must not make Razorpay retry
@@ -943,7 +933,6 @@ app.post(
     if (!UPLOAD_KINDS.includes(kind)) throw new HttpError(400, 'Invalid kind');
     if (!ext || !Buffer.isBuffer(req.body) || !req.body.length) throw new HttpError(400, 'Unsupported or empty file');
     if ((ext === 'mp4' || ext === 'mov') && kind !== 'sample') throw new HttpError(400, 'Videos allowed only for samples');
-    if (PRIVATE_KINDS.includes(kind) && ext !== 'jpg' && ext !== 'png' && ext !== 'webp') throw new HttpError(400, 'Only images allowed');
     const folderMap = {
       profile: 'user_media/profilephoto',
       banner: 'user_media/banner',
@@ -953,15 +942,6 @@ app.post(
     };
     if (kind === 'sample') await assertActive(req.params.uuid);
     const contentType = req.headers['content-type'].split(';')[0];
-    if (PRIVATE_KINDS.includes(kind)) {
-      const docPath = `${req.params.uuid}/${kind}-${Date.now()}.${ext}`;
-      const { error } = await supabase.storage.from(DOCS_BUCKET).upload(docPath, req.body, { contentType });
-      if (error) {
-        console.error('[storage]', error.message);
-        throw new HttpError(500, 'Upload failed');
-      }
-      return res.status(201).json({ success: true, path: docPath });
-    }
     const path = `${folderMap[kind]}/${req.params.uuid}-${Date.now()}.${ext}`;
     const { error } = await supabase.storage.from(STORAGE_BUCKET).upload(path, req.body, { contentType });
     if (error) {
