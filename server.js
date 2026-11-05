@@ -331,6 +331,19 @@ const recordOtpSend = (phone) => {
   if (otpSends.size > 5000) for (const [k, v] of otpSends) if (now - v.windowStart > 3600_000) otpSends.delete(k);
 };
 
+// Throttles, then sends (or re-sends) a Fast2SMS OTP to the number
+const sendOtp = async (phone) => {
+  checkOtpThrottle(phone);
+  // A pending OTP for this number is re-sent, otherwise a new one is created
+  let result = otpSends.has(phone) ? await fast2sms('resend', { mobile: phone }) : null;
+  if (!result?.ok) result = await fast2sms('send', { mobile: phone, otp_id: FAST2SMS_OTP_ID, otp_length: 6, otp_expiry: Number(OTP_TTL_MINUTES) });
+  if (!result.ok) {
+    console.error('[fast2sms] send', result.status, result.message);
+    throw new HttpError(502, 'Could not send OTP, please try again');
+  }
+  recordOtpSend(phone);
+};
+
 app.post(
   '/api/otp/send',
   otpLimiter,
@@ -339,16 +352,7 @@ app.post(
     if (db(await supabase.from('users').select('id').eq('phone', phone).limit(1)).length) {
       throw new HttpError(409, 'Phone already registered');
     }
-    checkOtpThrottle(phone);
-
-    // A pending OTP for this number is re-sent, otherwise a new one is created
-    let result = otpSends.has(phone) ? await fast2sms('resend', { mobile: phone }) : null;
-    if (!result?.ok) result = await fast2sms('send', { mobile: phone, otp_id: FAST2SMS_OTP_ID, otp_length: 6, otp_expiry: Number(OTP_TTL_MINUTES) });
-    if (!result.ok) {
-      console.error('[fast2sms] send', result.status, result.message);
-      throw new HttpError(502, 'Could not send OTP, please try again');
-    }
-    recordOtpSend(phone);
+    await sendOtp(phone);
     res.json({ success: true, resend_after: OTP_RESEND_SECONDS });
   }),
 );
@@ -1242,9 +1246,78 @@ app.get(
   }),
 );
 
-const cartRequestSchema = z.object({
+// ---------- website clients (separate from partner/supplier users) ----------
+const CLIENT_TOKEN_DAYS = 90;
+const clientToken = (id) => jwt.sign({ sub: id, typ: 'client' }, JWT_SECRET, { expiresIn: `${CLIENT_TOKEN_DAYS}d` });
+
+app.post(
+  '/api/client/otp/send',
+  otpLimiter,
+  wrap(async (req, res) => {
+    const { phone } = parse(z.object({ phone: phoneSchema }), req.body);
+    await sendOtp(phone);
+    res.json({ success: true, resend_after: OTP_RESEND_SECONDS });
+  }),
+);
+
+const clientSignupSchema = z.object({
   name: z.string().trim().min(2).max(80),
   phone: phoneSchema,
+  otpToken: z.string().min(1, 'Verify your mobile number first'),
+  location_name: z.string().trim().min(2).max(200),
+  latitude: z.number().min(-90).max(90).optional(),
+  longitude: z.number().min(-180).max(180).optional(),
+});
+
+// Signup (or sign in again from a new device): the verified phone number is the identity
+app.post(
+  '/api/client/signup',
+  authLimiter,
+  wrap(async (req, res) => {
+    const b = parse(clientSignupSchema, req.body);
+    try {
+      const payload = jwt.verify(b.otpToken, JWT_SECRET);
+      if (payload.typ !== 'phone_verified' || payload.phone !== b.phone) throw new Error();
+    } catch {
+      throw new HttpError(400, 'Mobile number is not verified, please verify with OTP');
+    }
+    const client = db(
+      await supabase
+        .from('clients')
+        .upsert(
+          {
+            name: b.name,
+            phone: b.phone,
+            location_name: b.location_name,
+            latitude: b.latitude ?? null,
+            longitude: b.longitude ?? null,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'phone' },
+        )
+        .select('id, name, phone, location_name')
+        .single(),
+    );
+    res.status(201).json({ success: true, token: clientToken(client.id), client });
+  }),
+);
+
+const getClient = async (req) => {
+  const header = req.headers.authorization || '';
+  let id;
+  try {
+    const payload = jwt.verify(header.replace(/^Bearer /, ''), JWT_SECRET);
+    if (payload.typ !== 'client') throw new Error();
+    id = payload.sub;
+  } catch {
+    throw new HttpError(401, 'Please sign up to send your request');
+  }
+  const rows = db(await supabase.from('clients').select('id, name, phone, location_name').eq('id', id).limit(1));
+  if (!rows.length) throw new HttpError(401, 'Please sign up to send your request');
+  return rows[0];
+};
+
+const cartRequestSchema = z.object({
   location_name: z.string().trim().min(2).max(200),
   latitude: z.number().min(-90).max(90).optional(),
   longitude: z.number().min(-180).max(180).optional(),
@@ -1260,23 +1333,31 @@ const cartRequestSchema = z.object({
     .max(100),
 });
 
-// Cart submitted by a client. Stored for the admin team only; there is no public read route.
+// Cart sent by a signed-in client. Stored for the admin team only; there is no public read route.
 app.post(
   '/api/cart-requests',
-  rateLimit({ windowMs: 60 * 60_000, limit: 10, standardHeaders: true, legacyHeaders: false }),
+  rateLimit({ windowMs: 60 * 60_000, limit: 20, standardHeaders: true, legacyHeaders: false }),
   wrap(async (req, res) => {
+    const client = await getClient(req);
     const b = parse(cartRequestSchema, req.body);
     db(
+      await supabase
+        .from('clients')
+        .update({ location_name: b.location_name, latitude: b.latitude ?? null, longitude: b.longitude ?? null, updated_at: new Date().toISOString() })
+        .eq('id', client.id),
+    );
+    db(
       await supabase.from('cart_requests').insert({
-        client_name: b.name,
-        client_phone: b.phone,
+        client_id: client.id,
+        client_name: client.name,
+        client_phone: client.phone,
         location_name: b.location_name,
         latitude: b.latitude ?? null,
         longitude: b.longitude ?? null,
         items: b.items,
       }),
     );
-    res.status(201).json({ success: true, message: 'Request received. We will contact you soon.' });
+    res.status(201).json({ success: true, message: 'Request received. Our partner will contact you shortly.' });
   }),
 );
 
