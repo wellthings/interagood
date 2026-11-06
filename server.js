@@ -1411,6 +1411,150 @@ app.get(
   }),
 );
 
+// ---------- admin panel ----------
+// Login needs all four: phone verified with OTP, username, login id and host, all from the same admin_panel row.
+const ADMIN_TOKEN_HOURS = 8;
+const ADMIN_MAX_FAILS = 5;
+const ADMIN_FAIL_WINDOW_MS = 15 * 60_000;
+const adminFails = new Map();
+const adminLoginLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 20, standardHeaders: true, legacyHeaders: false });
+const DUMMY_HASH = bcrypt.hashSync('not-a-real-host', 10);
+
+const adminLocked = (phone) => {
+  const e = adminFails.get(phone);
+  if (!e) return false;
+  if (Date.now() - e.first > ADMIN_FAIL_WINDOW_MS) { adminFails.delete(phone); return false; }
+  return e.count >= ADMIN_MAX_FAILS;
+};
+const adminFailed = (phone) => {
+  const e = adminFails.get(phone);
+  if (!e || Date.now() - e.first > ADMIN_FAIL_WINDOW_MS) adminFails.set(phone, { count: 1, first: Date.now() });
+  else e.count += 1;
+  if (adminFails.size > 2000) for (const [k, v] of adminFails) if (Date.now() - v.first > ADMIN_FAIL_WINDOW_MS) adminFails.delete(k);
+};
+
+const findAdminByPhone = async (phone) =>
+  db(await supabase.from('admin_panel').select('id, phone, username, login_id, host, is_active, bound_at').eq('phone', phone).limit(1))[0];
+
+// Always answers the same way, so it cannot be used to find out which numbers are admins
+app.post(
+  '/api/admin/otp/send',
+  adminLoginLimiter,
+  wrap(async (req, res) => {
+    const { phone } = parse(z.object({ phone: phoneSchema }), req.body);
+    if (adminLocked(phone)) throw new HttpError(429, 'Too many failed attempts. Try again after 15 minutes.');
+    const admin = await findAdminByPhone(phone);
+    if (admin?.is_active) await sendOtp(phone);
+    res.json({ success: true, resend_after: OTP_RESEND_SECONDS });
+  }),
+);
+
+const adminLoginSchema = z.object({
+  phone: phoneSchema,
+  otp: z.string().trim().regex(/^\d{4,8}$/),
+  username: z.string().trim().min(1).max(80),
+  login_id: z.string().trim().min(1).max(80),
+  host: z.string().min(1).max(200),
+});
+
+app.post(
+  '/api/admin/login',
+  adminLoginLimiter,
+  wrap(async (req, res) => {
+    const b = parse(adminLoginSchema, req.body);
+    if (adminLocked(b.phone)) throw new HttpError(429, 'Too many failed attempts. Try again after 15 minutes.');
+    const reject = () => {
+      adminFailed(b.phone);
+      throw new HttpError(401, 'Invalid login details or OTP');
+    };
+    const admin = await findAdminByPhone(b.phone);
+    // every check runs (and fails with the same message) so nothing reveals which detail was wrong
+    const hostOk = await bcrypt.compare(b.host, admin?.host ?? DUMMY_HASH);
+    const detailsOk =
+      !!admin && admin.is_active && hostOk && admin.username.toLowerCase() === b.username.toLowerCase() && admin.login_id === b.login_id;
+    if (!detailsOk) return reject();
+    const otp = await fast2sms('verify', { mobile: b.phone, otp: b.otp });
+    if (!otp.ok) {
+      if (otp.status >= 500) throw new HttpError(502, 'Could not verify OTP, please try again');
+      return reject();
+    }
+    otpSends.delete(b.phone);
+    adminFails.delete(b.phone);
+    const now = new Date().toISOString();
+    db(await supabase.from('admin_panel').update({ last_login_at: now, bound_at: admin.bound_at ?? now }).eq('id', admin.id));
+    const token = jwt.sign({ sub: admin.id, typ: 'admin' }, JWT_SECRET, { expiresIn: `${ADMIN_TOKEN_HOURS}h` });
+    res.json({ success: true, token, admin: { id: admin.id, username: admin.username } });
+  }),
+);
+
+const getAdmin = async (req) => {
+  let id;
+  try {
+    const payload = jwt.verify((req.headers.authorization || '').replace(/^Bearer /, ''), JWT_SECRET);
+    if (payload.typ !== 'admin') throw new Error();
+    id = payload.sub;
+  } catch {
+    throw new HttpError(401, 'Admin login required');
+  }
+  const row = db(await supabase.from('admin_panel').select('id, username, is_active, bound_at').eq('id', id).limit(1))[0];
+  if (!row?.is_active || !row.bound_at) throw new HttpError(401, 'Admin login required');
+  return row;
+};
+const adminApiLimiter = rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: true, legacyHeaders: false });
+
+app.get(
+  '/api/admin/me',
+  adminApiLimiter,
+  wrap(async (req, res) => {
+    const a = await getAdmin(req);
+    res.json({ success: true, admin: { id: a.id, username: a.username } });
+  }),
+);
+
+// Orders with the client, items and per-category assignment
+app.get(
+  '/api/admin/orders',
+  adminApiLimiter,
+  wrap(async (req, res) => {
+    await getAdmin(req);
+    const rows = db(
+      await supabase
+        .from('cart_requests')
+        .select(
+          'id, order_no, status, location_name, latitude, longitude, created_at, clients(id, name, phone), order_assignments(id, work_type, status, partner_id), order_items(work_type, work_unit, requirement_type)',
+        )
+        .order('created_at', { ascending: false })
+        .limit(200),
+    );
+    res.json({ success: true, data: rows });
+  }),
+);
+
+// What clients have in their cart right now (not ordered yet)
+app.get(
+  '/api/admin/carts',
+  adminApiLimiter,
+  wrap(async (req, res) => {
+    await getAdmin(req);
+    const rows = db(
+      await supabase.from('client_carts').select('client_id, items, updated_at, clients(name, phone, location_name)').order('updated_at', { ascending: false }).limit(200),
+    );
+    res.json({ success: true, data: rows.filter((r) => r.items?.length) });
+  }),
+);
+
+app.patch(
+  '/api/admin/orders/:id/status',
+  adminApiLimiter,
+  wrap(async (req, res) => {
+    await getAdmin(req);
+    const { status } = parse(z.object({ status: z.enum(['new', 'contacted', 'closed']) }), req.body);
+    const id = parse(z.string().uuid(), req.params.id);
+    db(await supabase.from('cart_requests').update({ status }).eq('id', id));
+    res.json({ success: true });
+  }),
+);
+
 // ---------- account ----------
 const TERMINAL_SUBSCRIPTION_STATUSES = ['cancelled', 'completed', 'expired'];
 
