@@ -1452,9 +1452,7 @@ app.post(
 const adminLoginSchema = z.object({
   phone: phoneSchema,
   otp: z.string().trim().regex(/^\d{4,8}$/),
-  username: z.string().trim().min(1).max(80),
-  login_id: z.string().trim().min(1).max(80),
-  host: z.string().min(1).max(200),
+  username: z.string().trim().min(1).max(100),
 });
 
 app.post(
@@ -1469,9 +1467,7 @@ app.post(
     };
     const admin = await findAdminByPhone(b.phone);
     // every check runs (and fails with the same message) so nothing reveals which detail was wrong
-    const hostOk = await bcrypt.compare(b.host, admin?.host ?? DUMMY_HASH);
-    const detailsOk =
-      !!admin && admin.is_active && hostOk && admin.username.toLowerCase() === b.username.toLowerCase() && admin.login_id === b.login_id;
+    const detailsOk = !!admin && admin.is_active && admin.username.toLowerCase() === b.username.toLowerCase();
     if (!detailsOk) return reject();
     const otp = await fast2sms('verify', { mobile: b.phone, otp: b.otp });
     if (!otp.ok) {
