@@ -1346,18 +1346,28 @@ app.post(
         .update({ location_name: b.location_name, latitude: b.latitude ?? null, longitude: b.longitude ?? null, updated_at: new Date().toISOString() })
         .eq('id', client.id),
     );
-    db(
-      await supabase.from('cart_requests').insert({
-        client_id: client.id,
-        client_name: client.name,
-        client_phone: client.phone,
-        location_name: b.location_name,
-        latitude: b.latitude ?? null,
-        longitude: b.longitude ?? null,
-        items: b.items,
-      }),
+    const order = db(
+      await supabase
+        .from('cart_requests')
+        .insert({
+          client_id: client.id,
+          client_name: client.name,
+          client_phone: client.phone,
+          location_name: b.location_name,
+          latitude: b.latitude ?? null,
+          longitude: b.longitude ?? null,
+          items: b.items,
+        })
+        .select('id, order_no')
+        .single(),
     );
-    res.status(201).json({ success: true, message: 'Request received. Our partner will contact you shortly.' });
+    const itemsError = (
+      await supabase
+        .from('order_items')
+        .insert(b.items.map((i) => ({ order_id: order.id, work_type: i.category, work_unit: i.module, requirement_type: i.mode })))
+    ).error;
+    if (itemsError) console.error('[order_items]', itemsError.message);
+    res.status(201).json({ success: true, order_no: order.order_no, message: 'Order placed. Our partner will contact you shortly.' });
   }),
 );
 
@@ -1370,7 +1380,7 @@ app.get(
     const rows = db(
       await supabase
         .from('cart_requests')
-        .select('id, items, status, created_at')
+        .select('id, order_no, items, status, created_at')
         .eq('client_id', client.id)
         .order('created_at', { ascending: false })
         .limit(30),
