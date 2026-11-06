@@ -1361,6 +1361,24 @@ app.post(
   }),
 );
 
+// Orders of the signed-in website client (status: new = under process, contacted, closed)
+app.get(
+  '/api/client/orders',
+  publicLimiter,
+  wrap(async (req, res) => {
+    const client = await getClient(req);
+    const rows = db(
+      await supabase
+        .from('cart_requests')
+        .select('id, items, status, created_at')
+        .eq('client_id', client.id)
+        .order('created_at', { ascending: false })
+        .limit(30),
+    );
+    res.json({ success: true, data: rows });
+  }),
+);
+
 // ---------- account ----------
 const TERMINAL_SUBSCRIPTION_STATUSES = ['cancelled', 'completed', 'expired'];
 
