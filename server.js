@@ -1317,20 +1317,29 @@ const getClient = async (req) => {
   return rows[0];
 };
 
+const cartItemSchema = z.object({
+  category: z.string().trim().min(1).max(80),
+  module: z.string().trim().min(1).max(80),
+  mode: z.enum(['new', 'repair', 'full_interior']),
+});
+
+// Mirrors the signed-in client's current cart so the team sees exactly what is in it right now
+app.put(
+  '/api/client/cart',
+  rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: true, legacyHeaders: false }),
+  wrap(async (req, res) => {
+    const client = await getClient(req);
+    const { items } = parse(z.object({ items: z.array(cartItemSchema).max(100) }), req.body);
+    db(await supabase.from('client_carts').upsert({ client_id: client.id, items, updated_at: new Date().toISOString() }, { onConflict: 'client_id' }));
+    res.json({ success: true });
+  }),
+);
+
 const cartRequestSchema = z.object({
   location_name: z.string().trim().min(2).max(200),
   latitude: z.number().min(-90).max(90).optional(),
   longitude: z.number().min(-180).max(180).optional(),
-  items: z
-    .array(
-      z.object({
-        category: z.string().trim().min(1).max(80),
-        module: z.string().trim().min(1).max(80),
-        mode: z.enum(['new', 'repair', 'full_interior']),
-      }),
-    )
-    .min(1)
-    .max(100),
+  items: z.array(cartItemSchema).min(1).max(100),
 });
 
 // Cart sent by a signed-in client. Stored for the admin team only; there is no public read route.
@@ -1361,12 +1370,25 @@ app.post(
         .select('id, order_no')
         .single(),
     );
+    // one assignment per work type, so a partner can be assigned category-wise
+    const workTypes = [...new Set(b.items.map((i) => i.category))];
+    const assignments = db(
+      await supabase.from('order_assignments').insert(workTypes.map((work_type) => ({ order_id: order.id, work_type }))).select('id, work_type'),
+    );
+    const assignmentOf = Object.fromEntries(assignments.map((a) => [a.work_type, a.id]));
     const itemsError = (
-      await supabase
-        .from('order_items')
-        .insert(b.items.map((i) => ({ order_id: order.id, work_type: i.category, work_unit: i.module, requirement_type: i.mode })))
+      await supabase.from('order_items').insert(
+        b.items.map((i) => ({
+          order_id: order.id,
+          assignment_id: assignmentOf[i.category],
+          work_type: i.category,
+          work_unit: i.module,
+          requirement_type: i.mode,
+        })),
+      )
     ).error;
     if (itemsError) console.error('[order_items]', itemsError.message);
+    await supabase.from('client_carts').delete().eq('client_id', client.id);
     res.status(201).json({ success: true, order_no: order.order_no, message: 'Order placed. Our partner will contact you shortly.' });
   }),
 );
@@ -1380,7 +1402,7 @@ app.get(
     const rows = db(
       await supabase
         .from('cart_requests')
-        .select('id, order_no, items, status, created_at')
+        .select('id, order_no, items, status, created_at, order_assignments(work_type, status)')
         .eq('client_id', client.id)
         .order('created_at', { ascending: false })
         .limit(30),
