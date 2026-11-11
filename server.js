@@ -495,27 +495,20 @@ app.get(
   '/api/site-images',
   wrap(async (req, res) => {
     const folder = req.query.folder || '';
-    const prefixes = folder ? [folder] : ['partner', 'supplier', 'ac', 'blinds', 'aluminum'];
     const publicBase = `${SUPABASE_URL}/storage/v1/object/public/${SITE_IMAGES_BUCKET}`;
-    let all = [];
-    for (const prefix of prefixes) {
-      const { data, error } = await supabase.storage.from(SITE_IMAGES_BUCKET).list(prefix, {
-        limit: 100,
-        sortBy: { column: 'name', order: 'asc' },
-      });
-      if (error) continue;
-      for (const f of (data || [])) {
-        if (f.name.startsWith('.')) continue;
-        if (!/\.(jpg|jpeg|png|webp|avif)$/i.test(f.name)) continue;
-        const fullPath = prefix ? `${prefix}/${f.name}` : f.name;
-        all.push({
-          name: f.name.replace(/\.[^/.]+$/, ''),
-          path: fullPath,
-          url: `${publicBase}/${encodeURIComponent(fullPath)}`,
-        });
-      }
-    }
-    res.json({ success: true, data: all });
+    const { data, error } = await supabase.storage.from(SITE_IMAGES_BUCKET).list(folder || undefined, {
+      limit: 100,
+      sortBy: { column: 'name', order: 'asc' },
+    });
+    if (error) throw error;
+    const items = (data || []).map((f) => ({
+      name: f.name,
+      isDir: !/\.(jpg|jpeg|png|webp|avif)$/i.test(f.name),
+      url: folder
+        ? `${publicBase}/${encodeURIComponent(`${folder}/${f.name}`)}`
+        : `${publicBase}/${encodeURIComponent(f.name)}`,
+    }));
+    res.json({ success: true, data: items });
   }),
 );
 
