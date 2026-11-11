@@ -519,11 +519,16 @@ app.get(
     const publicBase = `${SUPABASE_URL}/storage/v1/object/public/${SITE_IMAGES_BUCKET}`;
     res.json({
       success: true,
-      data: images.map((img) => ({
-        name: img.name.replace(/\.[^/.]+$/, ''),
-        path: img.path,
-        url: `${publicBase}/${encodeURIComponent(img.path)}`,
-      })),
+      data: images.map((img) => {
+        const baseName = img.name.replace(/\.[^/.]+$/, '');
+        const displayName = baseName.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+        return {
+          name: baseName,
+          displayName: displayName,
+          path: img.path,
+          url: `${publicBase}/${encodeURIComponent(img.path)}`,
+        };
+      }),
     });
   }),
 );
