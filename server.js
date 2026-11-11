@@ -374,7 +374,7 @@ app.post(
   }),
 );
 
-const SIGNUP_ROLES = ['partner', 'supplier'];
+const SIGNUP_ROLES = ['client', 'partner', 'supplier'];
 
 // Live availability check used by the website signup form (rate limited, returns only a boolean)
 app.get(
@@ -717,6 +717,14 @@ const ageYears = {
 };
 const categoryPick = { category_id: z.coerce.number().int().positive() };
 const setupSchemas = {
+  client: z.object({
+    full_name: z.string().trim().min(2).max(120),
+    address: z.string().trim().min(3).max(300).nullish().or(z.literal('')),
+    city: z.string().trim().min(2).max(80).nullish().or(z.literal('')),
+    state: z.string().trim().min(2).max(80).nullish().or(z.literal('')),
+    pincode: z.string().regex(/^\d{6}$/, 'Pincode must be 6 digits').nullish().or(z.literal('')),
+    profile_photo_url: z.string().url().nullish().or(z.literal('')),
+  }),
   supplier: z.object({ ...profileBase, ...categoryPick }),
   partner: z.object({
     ...profileBase, ...categoryPick, ...ageYears,
