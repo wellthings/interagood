@@ -21,6 +21,7 @@ const {
   CORS_ORIGIN = '*',
   STORAGE_BUCKET = 'media',
   GUIDE_BUCKET = 'admin_uploads',
+  SITE_IMAGES_BUCKET = 'site_images',
   FAST2SMS_API_KEY,
   FAST2SMS_OTP_ID,
   OTP_TTL_MINUTES = 5,
@@ -485,6 +486,28 @@ const categoryRoute = (table) =>
 
 app.get('/api/categories/partner', categoryRoute('partner_categories'));
 app.get('/api/categories/supplier', categoryRoute('supplier_categories'));
+
+// Public site images from Supabase storage bucket "site_images" for the homepage gallery
+app.get(
+  '/api/site-images',
+  wrap(async (_req, res) => {
+    const { data, error } = await supabase.storage.from(SITE_IMAGES_BUCKET).list('', {
+      limit: 100,
+      sortBy: { column: 'name', order: 'asc' },
+    });
+    if (error) throw error;
+    const publicBase = `${SUPABASE_URL}/storage/v1/object/public/${SITE_IMAGES_BUCKET}`;
+    res.json({
+      success: true,
+      data: (data || [])
+        .filter((f) => !f.name.startsWith('.') && /\.(jpg|jpeg|png|webp|avif)$/i.test(f.name))
+        .map((f) => ({
+          name: f.name.replace(/\.[^/.]+$/, ''),
+          url: `${publicBase}/${encodeURIComponent(f.name)}`,
+        })),
+    });
+  }),
+);
 
 app.get(
   '/api/age-options',
