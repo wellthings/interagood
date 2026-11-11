@@ -491,24 +491,40 @@ app.get('/api/categories/partner', categoryRoute('partner_categories'));
 app.get('/api/categories/supplier', categoryRoute('supplier_categories'));
 
 // Public site images from Supabase storage bucket "site_images" for the homepage gallery
+async function listImagesRecursive(bucket, prefix = '', depth = 0) {
+  if (depth > 4) return [];
+  const { data, error } = await supabase.storage.from(bucket).list(prefix || undefined, {
+    limit: 1000,
+    sortBy: { column: 'name', order: 'asc' },
+  });
+  if (error) return [];
+  let images = [];
+  for (const f of (data || [])) {
+    if (f.name.startsWith('.')) continue;
+    const fullPath = prefix ? `${prefix}/${f.name}` : f.name;
+    if (/\.(jpg|jpeg|png|webp|avif)$/i.test(f.name)) {
+      images.push({ name: f.name, path: fullPath });
+    } else if (!f.name.includes('.')) {
+      // It's a folder, recurse into it
+      images = images.concat(await listImagesRecursive(bucket, fullPath, depth + 1));
+    }
+  }
+  return images;
+}
+
 app.get(
   '/api/site-images',
-  wrap(async (req, res) => {
-    const folder = req.query.folder || '';
+  wrap(async (_req, res) => {
+    const images = await listImagesRecursive(SITE_IMAGES_BUCKET);
     const publicBase = `${SUPABASE_URL}/storage/v1/object/public/${SITE_IMAGES_BUCKET}`;
-    const { data, error } = await supabase.storage.from(SITE_IMAGES_BUCKET).list(folder || undefined, {
-      limit: 100,
-      sortBy: { column: 'name', order: 'asc' },
+    res.json({
+      success: true,
+      data: images.map((img) => ({
+        name: img.name.replace(/\.[^/.]+$/, ''),
+        path: img.path,
+        url: `${publicBase}/${encodeURIComponent(img.path)}`,
+      })),
     });
-    if (error) throw error;
-    const items = (data || []).map((f) => ({
-      name: f.name,
-      isDir: !/\.(jpg|jpeg|png|webp|avif)$/i.test(f.name),
-      url: folder
-        ? `${publicBase}/${encodeURIComponent(`${folder}/${f.name}`)}`
-        : `${publicBase}/${encodeURIComponent(f.name)}`,
-    }));
-    res.json({ success: true, data: items });
   }),
 );
 
