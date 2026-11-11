@@ -48,6 +48,9 @@ const publicUrl = (path, bucket = STORAGE_BUCKET) => supabase.storage.from(bucke
 supabase.storage
   .createBucket(STORAGE_BUCKET, { public: true })
   .then(({ error }) => error && !/already exists/i.test(error.message) && console.error('[storage]', error.message));
+supabase.storage
+  .createBucket(SITE_IMAGES_BUCKET, { public: true })
+  .then(({ error }) => error && !/already exists/i.test(error.message) && console.error('[storage]', error.message));
 
 const UPLOAD_TYPES = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'video/mp4': 'mp4', 'video/quicktime': 'mov' };
 const UPLOAD_KINDS = ['profile', 'banner', 'sample', 'tools', 'team'];
