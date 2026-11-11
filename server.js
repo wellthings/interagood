@@ -493,22 +493,29 @@ app.get('/api/categories/supplier', categoryRoute('supplier_categories'));
 // Public site images from Supabase storage bucket "site_images" for the homepage gallery
 app.get(
   '/api/site-images',
-  wrap(async (_req, res) => {
-    const { data, error } = await supabase.storage.from(SITE_IMAGES_BUCKET).list('', {
-      limit: 100,
-      sortBy: { column: 'name', order: 'asc' },
-    });
-    if (error) throw error;
+  wrap(async (req, res) => {
+    const folder = req.query.folder || '';
+    const prefixes = folder ? [folder] : ['partner/', 'supplier/', 'ac/', 'blinds/', 'aluminum/'];
     const publicBase = `${SUPABASE_URL}/storage/v1/object/public/${SITE_IMAGES_BUCKET}`;
-    res.json({
-      success: true,
-      data: (data || [])
-        .filter((f) => !f.name.startsWith('.') && /\.(jpg|jpeg|png|webp|avif)$/i.test(f.name))
-        .map((f) => ({
+    let all = [];
+    for (const prefix of prefixes) {
+      const { data, error } = await supabase.storage.from(SITE_IMAGES_BUCKET).list(prefix, {
+        limit: 100,
+        sortBy: { column: 'name', order: 'asc' },
+      });
+      if (error) continue;
+      for (const f of (data || [])) {
+        if (f.name.startsWith('.')) continue;
+        if (!/\.(jpg|jpeg|png|webp|avif)$/i.test(f.name)) continue;
+        const fullPath = prefix ? `${prefix}${f.name}` : f.name;
+        all.push({
           name: f.name.replace(/\.[^/.]+$/, ''),
-          url: `${publicBase}/${encodeURIComponent(f.name)}`,
-        })),
-    });
+          path: fullPath,
+          url: `${publicBase}/${encodeURIComponent(fullPath)}`,
+        });
+      }
+    }
+    res.json({ success: true, data: all });
   }),
 );
 
