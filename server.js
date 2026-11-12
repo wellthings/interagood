@@ -197,6 +197,7 @@ const requireActive = wrap(async (req, _res, next) => {
 const PLANS = {
   supplier: { key: 'interagood_supplier_219', name: 'InteraGood Supplier Program', amountPaise: 21900, leadsStatus: 'deals_activated' },
   partner: { key: 'interagood_partner_109', name: 'InteraGood Partner Program', amountPaise: 10900, leadsStatus: 'leads_activated' },
+  architect: { key: 'interagood_architect_310', name: 'InteraGood Architect Program', amountPaise: 31000, leadsStatus: 'active' },
 };
 
 const rzp = async (method, path, body) => {
@@ -840,7 +841,7 @@ app.post(
         banner_url: user.banner_url,
         is_online: !!user.is_online,
         payment_status: user.payment_status,
-        amount: PLANS[user.role].amountPaise / 100,
+        amount: PLANS[user.role] ? PLANS[user.role].amountPaise / 100 : null,
       },
     });
   }),
