@@ -46,7 +46,7 @@ export const verifyPayuHash = (postback, salt = PAYU_SALT) => {
 };
 
 // Build the form fields that must be POSTed to PayU's payment page.
-export const buildPayuOrder = ({ txnid, amount, productinfo, firstname, email, phone, udf1, udf2, udf3, udf4, udf5 }) => {
+export const buildPayuOrder = ({ txnid, amount, productinfo, firstname, email, phone, udf1, udf2, udf3, udf4, udf5, surl, furl }) => {
   const base = {
     key: PAYU_KEY,
     txnid: String(txnid),
@@ -55,8 +55,8 @@ export const buildPayuOrder = ({ txnid, amount, productinfo, firstname, email, p
     firstname: String(firstname || ''),
     email: String(email || ''),
     phone: String(phone || ''),
-    surl: `${PAYU_BASE}/postback/success`,
-    furl: `${PAYU_BASE}/postback/failure`,
+    surl: surl || `${PAYU_BASE}/postback/success`,
+    furl: furl || `${PAYU_BASE}/postback/failure`,
     udf1: udf1 || '',
     udf2: udf2 || '',
     udf3: udf3 || '',

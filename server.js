@@ -32,6 +32,8 @@ const {
   RAZORPAY_PLAN_ID,
   RAZORPAY_PARTNER_PLAN_ID,
   CRON_SECRET,
+  APP_URL = 'https://www.interagood.in',
+  API_PUBLIC_URL = '',
   FAST2SMS_ROUTE = 'q',
   FAST2SMS_SENDER = 'FSTSMS',
 } = process.env;
@@ -80,6 +82,8 @@ app.use(
     },
   }),
 );
+// PayU posts its result back as a form (application/x-www-form-urlencoded)
+app.use(express.urlencoded({ extended: false, limit: '1mb' }));
 app.use(express.raw({ type: Object.keys(UPLOAD_TYPES), limit: '50mb' }));
 app.use('/api', rateLimit({ windowMs: 60_000, limit: 300, standardHeaders: true, legacyHeaders: false }));
 const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 30, standardHeaders: true, legacyHeaders: false });
@@ -916,44 +920,77 @@ app.post(
   }),
 );
 
-// ---------- payu payment placeholders (modular; enable by setting PAYU_KEY + PAYU_SALT) ----------
-const payuInitSchema = z.object({
-  txnid: z.string().trim().min(3).max(60),
-  amount: z.coerce.number().positive(),
-  productinfo: z.string().trim().min(1).max(200),
-  firstname: z.string().trim().min(1).max(120),
-  email: z.string().trim().email().nullish(),
-  phone: z.string().trim().max(15).nullish(),
-  udf1: z.string().max(255).optional(),
-  udf2: z.string().max(255).optional(),
-  udf3: z.string().max(255).optional(),
-  udf4: z.string().max(255).optional(),
-  udf5: z.string().max(255).optional(),
-});
-
+// ---------- payu payment (monthly one-time; no AutoPay) ----------
+// Init: the amount and customer details come from the server (never the client).
 app.post(
   '/api/payments/payu/init',
   auth,
   wrap(async (req, res) => {
     if (!isPayuConfigured()) throw new HttpError(503, 'PayU is not configured');
-    const body = parse(payuInitSchema, req.body);
-    const order = buildPayuOrder({ ...body, udf1: req.params.uuid, ...(body.udf1 ? { udf1: `${req.params.uuid}|${body.udf1}` } : {}) });
+    const user = await getUser(req.auth.sub);
+    const plan = PLANS[user.role];
+    if (!plan) throw new HttpError(403, 'No plan available for this role');
+    const publicApi = API_PUBLIC_URL || `${req.protocol}://${req.get('host')}`;
+    const txnid = `ig${Date.now()}${Math.floor(Math.random() * 900 + 100)}`;
+    const order = buildPayuOrder({
+      txnid,
+      amount: (plan.amountPaise / 100).toFixed(2),
+      productinfo: `${plan.name} - monthly`.slice(0, 100),
+      firstname: String(user.full_name || user.business_name || user.username || 'Customer').slice(0, 60),
+      email: user.email || `${normalizePhone(user.phone)}@interagood.in`,
+      phone: normalizePhone(user.phone),
+      udf1: user.id,
+      surl: `${publicApi}/api/payments/payu/return`,
+      furl: `${publicApi}/api/payments/payu/return`,
+    });
     res.json({ success: true, order });
   }),
 );
 
+// PayU posts the result back here (surl/furl). Verify the hash, activate the paid cycle, then return to the app.
 app.post(
-  '/api/payments/payu/verify',
-  auth,
+  '/api/payments/payu/return',
   wrap(async (req, res) => {
     if (!isPayuConfigured()) throw new HttpError(503, 'PayU is not configured');
-    const postback = parse(z.object({ hash: z.string(), status: z.string(), txnid: z.string(), amount: z.string(), productinfo: z.string(), email: z.string().optional(), firstname: z.string().optional(), udf1: z.string().optional() }), req.body);
-    if (!verifyPayuHash(postback)) throw new HttpError(400, 'Payment verification failed');
-    if (postback.status !== 'success') throw new HttpError(400, 'Payment was not successful');
+    const fail = (reason) => res.redirect(`${APP_URL}/payment-return.html?status=failure&reason=${encodeURIComponent(reason)}`);
+    const postback = parse(
+      z.object({
+        status: z.string(),
+        txnid: z.string(),
+        amount: z.string(),
+        productinfo: z.string(),
+        firstname: z.string().nullish(),
+        email: z.string().nullish(),
+        key: z.string().nullish(),
+        hash: z.string(),
+        udf1: z.string().nullish(),
+        udf2: z.string().nullish(),
+        udf3: z.string().nullish(),
+        udf4: z.string().nullish(),
+        udf5: z.string().nullish(),
+      }),
+      req.body,
+    );
+    if (!verifyPayuHash(postback)) return fail('hash');
     const userId = (postback.udf1 || '').split('|')[0];
-    if (userId !== req.params.uuid) throw new HttpError(403, 'Payment does not belong to this user');
-    await activateSubscriber(req.params.uuid, postback.txnid);
-    res.json({ success: true, message: 'Payment verified', txnid: postback.txnid });
+    if (!z.string().uuid().safeParse(userId).success) return fail('user');
+    let user;
+    try {
+      user = await getUser(userId);
+    } catch {
+      return fail('user');
+    }
+    const plan = PLANS[user.role];
+    const expectedAmount = plan ? (plan.amountPaise / 100).toFixed(2) : null;
+    if (postback.status !== 'success') return fail('status');
+    if (!expectedAmount || Number(postback.amount) !== Number(expectedAmount)) return fail('amount');
+    try {
+      await activateSubscriber(userId, postback.txnid);
+    } catch (err) {
+      if (err.status !== 404) throw err;
+      return fail('activate');
+    }
+    res.redirect(`${APP_URL}/payment-return.html?status=success`);
   }),
 );
 
