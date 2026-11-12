@@ -9,6 +9,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { z } from 'zod';
 import { createClient } from '@supabase/supabase-js';
+import { isPayuConfigured, buildPayuOrder, verifyPayuHash } from './payu.js';
 
 const {
   PORT = 3000,
@@ -51,9 +52,14 @@ supabase.storage
 supabase.storage
   .createBucket(SITE_IMAGES_BUCKET, { public: true })
   .then(({ error }) => error && !/already exists/i.test(error.message) && console.error('[storage]', error.message));
+for (const b of ['partner_samples', 'architect_portfolio', 'supplier_products']) {
+  supabase.storage
+    .createBucket(b, { public: false })
+    .then(({ error }) => error && !/already exists/i.test(error.message) && console.error('[storage]', b, error.message));
+}
 
 const UPLOAD_TYPES = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'video/mp4': 'mp4', 'video/quicktime': 'mov' };
-const UPLOAD_KINDS = ['profile', 'banner', 'sample', 'tools', 'team'];
+const UPLOAD_KINDS = ['profile', 'banner', 'sample', 'tools', 'team', 'partner_sample', 'architect_post', 'supplier_product'];
 
 const ACCESS_TTL = JWT_ACCESS_EXPIRES_IN;
 const REFRESH_TTL = JWT_REFRESH_EXPIRES_IN;
@@ -765,18 +771,15 @@ const ageYears = {
   experience_years: z.coerce.number().int().min(0).max(40),
 };
 const categoryPick = { category_id: z.coerce.number().int().positive() };
+const skillLevel = z.enum(['new', 'intermediate', 'experienced']);
 const setupSchemas = {
-  client: z.object({
-    full_name: z.string().trim().min(2).max(120),
-    address: z.string().trim().min(3).max(300).nullish().or(z.literal('')),
-    city: z.string().trim().min(2).max(80).nullish().or(z.literal('')),
-    state: z.string().trim().min(2).max(80).nullish().or(z.literal('')),
-    pincode: z.string().regex(/^\d{6}$/, 'Pincode must be 6 digits').nullish().or(z.literal('')),
-    profile_photo_url: z.string().url().nullish().or(z.literal('')),
+  supplier: z.object({
+    ...profileBase, ...categoryPick,
+    shop_years: z.coerce.number().int().min(0).max(100),
   }),
-  supplier: z.object({ ...profileBase, ...categoryPick }),
   partner: z.object({
     ...profileBase, ...categoryPick, ...ageYears,
+    skill_level: skillLevel,
     has_tools: z.boolean(),
     tools_photo_url: z.string().url().nullish().or(z.literal('')),
     has_team: z.boolean(),
@@ -787,7 +790,8 @@ const setupSchemas = {
     worked_with_team_before: z.boolean(),
   }),
   architect: z.object({
-    ...profileBase, ...categoryPick,
+    ...profileBase, ...categoryPick, ...ageYears,
+    skill_level: skillLevel,
     education: z.string().trim().min(2).max(150).nullish().or(z.literal('')),
     design_software: z.string().trim().min(2).max(80).nullish().or(z.literal('')),
     uses_boq_tools: z.boolean(),
@@ -928,6 +932,47 @@ app.post(
   }),
 );
 
+// ---------- payu payment placeholders (modular; enable by setting PAYU_KEY + PAYU_SALT) ----------
+const payuInitSchema = z.object({
+  txnid: z.string().trim().min(3).max(60),
+  amount: z.coerce.number().positive(),
+  productinfo: z.string().trim().min(1).max(200),
+  firstname: z.string().trim().min(1).max(120),
+  email: z.string().trim().email().nullish(),
+  phone: z.string().trim().max(15).nullish(),
+  udf1: z.string().max(255).optional(),
+  udf2: z.string().max(255).optional(),
+  udf3: z.string().max(255).optional(),
+  udf4: z.string().max(255).optional(),
+  udf5: z.string().max(255).optional(),
+});
+
+app.post(
+  '/api/payments/payu/init',
+  auth,
+  wrap(async (req, res) => {
+    if (!isPayuConfigured()) throw new HttpError(503, 'PayU is not configured');
+    const body = parse(payuInitSchema, req.body);
+    const order = buildPayuOrder({ ...body, udf1: req.params.uuid, ...(body.udf1 ? { udf1: `${req.params.uuid}|${body.udf1}` } : {}) });
+    res.json({ success: true, order });
+  }),
+);
+
+app.post(
+  '/api/payments/payu/verify',
+  auth,
+  wrap(async (req, res) => {
+    if (!isPayuConfigured()) throw new HttpError(503, 'PayU is not configured');
+    const postback = parse(z.object({ hash: z.string(), status: z.string(), txnid: z.string(), amount: z.string(), productinfo: z.string(), email: z.string().optional(), firstname: z.string().optional(), udf1: z.string().optional() }), req.body);
+    if (!verifyPayuHash(postback)) throw new HttpError(400, 'Payment verification failed');
+    if (postback.status !== 'success') throw new HttpError(400, 'Payment was not successful');
+    const userId = (postback.udf1 || '').split('|')[0];
+    if (userId !== req.params.uuid) throw new HttpError(403, 'Payment does not belong to this user');
+    await activateSubscriber(req.params.uuid, postback.txnid);
+    res.json({ success: true, message: 'Payment verified', txnid: postback.txnid });
+  }),
+);
+
 // Keeps the user row in sync with Razorpay (renewals, failed charges, cancellations)
 app.post(
   '/api/razorpay/webhook',
@@ -1010,11 +1055,26 @@ app.post(
     };
     if (kind === 'sample') await assertActive(req.params.uuid);
     const contentType = req.headers['content-type'].split(';')[0];
-    const path = `${folderMap[kind]}/${req.params.uuid}-${Date.now()}.${ext}`;
-    const { error } = await supabase.storage.from(STORAGE_BUCKET).upload(path, req.body, { contentType });
+    const bucketMap = {
+      profile: STORAGE_BUCKET, banner: STORAGE_BUCKET, sample: STORAGE_BUCKET,
+      tools: STORAGE_BUCKET, team: STORAGE_BUCKET,
+      partner_sample: 'partner_samples',
+      architect_post: 'architect_portfolio',
+      supplier_product: 'supplier_products',
+    };
+    const path = `${folderMap[kind] || kind}/${req.params.uuid}-${Date.now()}.${ext}`;
+    const bucket = bucketMap[kind] || STORAGE_BUCKET;
+    const isPrivate = kind === 'partner_sample' || kind === 'architect_post' || kind === 'supplier_product';
+    const { error } = await supabase.storage.from(bucket).upload(path, req.body, { contentType });
     if (error) {
       console.error('[storage]', error.message);
       throw new HttpError(500, 'Upload failed');
+    }
+    if (isPrivate) {
+      // Private buckets: generate a signed URL valid for 1 hour for the uploader to preview
+      const { data, error: signErr } = await supabase.storage.from(bucket).createSignedUrl(path, 3600);
+      res.status(201).json({ success: true, url: signErr ? publicUrl(path, bucket) : data.signedUrl });
+      return;
     }
     res.status(201).json({ success: true, url: publicUrl(path) });
   }),
@@ -1517,6 +1577,7 @@ const adminLoginSchema = z.object({
   phone: phoneSchema,
   otp: z.string().trim().regex(/^\d{4,8}$/),
   username: z.string().trim().min(1).max(100),
+  login_id: z.string().trim().min(1).max(100),
 });
 
 app.post(
@@ -1531,7 +1592,7 @@ app.post(
     };
     const admin = await findAdminByPhone(b.phone);
     // every check runs (and fails with the same message) so nothing reveals which detail was wrong
-    const detailsOk = !!admin && admin.is_active && admin.username.toLowerCase() === b.username.toLowerCase();
+    const detailsOk = !!admin && admin.is_active && admin.username.toLowerCase() === b.username.toLowerCase() && admin.login_id === b.login_id;
     if (!detailsOk) return reject();
     const otp = await fast2sms('verify', { mobile: b.phone, otp: b.otp });
     if (!otp.ok) {
