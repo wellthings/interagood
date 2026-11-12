@@ -767,8 +767,10 @@ const setupSchemas = {
     team_photo_url: z.string().url().nullish().or(z.literal('')),
     team_members_count: z.coerce.number().int().min(0).max(500).nullish(),
     knows_work_completely: z.boolean(),
-    knows_pricing: z.boolean(),
-    worked_with_team_before: z.boolean(),
+    // The partner form asks "knows_work_completely" (work, pricing, calculation and client dealing) and
+    // does not collect these separately, so they are optional and derived in the route below.
+    knows_pricing: z.boolean().optional(),
+    worked_with_team_before: z.boolean().optional(),
   }),
   architect: z.object({
     ...profileBase, ...categoryPick, ...ageYears,
@@ -816,6 +818,10 @@ app.post(
       if (data.has_team && !(data.team_members_count > 0)) throw new HttpError(400, 'Team member count is required');
       if (data.has_team && !data.team_photo_url) throw new HttpError(400, 'Team photo is required');
       if (!data.has_team) { data.team_members_count = 0; data.team_photo_url = null; }
+      // "knows_work_completely" already covers work, pricing, calculation and client dealing.
+      // The partner form does not ask "worked with a team before", so derive it from having a team.
+      if (data.knows_pricing == null) data.knows_pricing = !!data.knows_work_completely;
+      if (data.worked_with_team_before == null) data.worked_with_team_before = !!data.has_team;
       data.knows_measurement_system = data.knows_pricing;
     }
     const igId = await ensureIgId(req.params.uuid);
