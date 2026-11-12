@@ -774,7 +774,7 @@ const setupSchemas = {
     worked_with_team_before: z.boolean().optional(),
   }),
   architect: z.object({
-    ...profileBase, ...categoryPick, ...ageYears,
+    ...profileBase, ...ageYears,
     skill_level: skillLevel,
     education: z.string().trim().min(2).max(150).nullish().or(z.literal('')),
     design_software: z.string().trim().min(2).max(80).nullish().or(z.literal('')),
@@ -819,11 +819,8 @@ app.post(
       if (data.has_team && !(data.team_members_count > 0)) throw new HttpError(400, 'Team member count is required');
       if (data.has_team && !data.team_photo_url) throw new HttpError(400, 'Team photo is required');
       if (!data.has_team) { data.team_members_count = 0; data.team_photo_url = null; }
-      // "knows_work_completely" already covers work, pricing, calculation and client dealing.
-      // The partner form does not ask "worked with a team before", so derive it from having a team.
-      if (data.knows_pricing == null) data.knows_pricing = !!data.knows_work_completely;
-      if (data.worked_with_team_before == null) data.worked_with_team_before = !!data.has_team;
-      data.knows_measurement_system = data.knows_pricing;
+      // Only map what the form actually collected; uncollected columns stay NULL.
+      if (data.knows_pricing != null) data.knows_measurement_system = data.knows_pricing;
     }
     const igId = await ensureIgId(req.params.uuid);
     await updateUser(req.params.uuid, { ...data, ig_id: igId });
