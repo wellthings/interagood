@@ -31,6 +31,9 @@ const {
   RAZORPAY_WEBHOOK_SECRET,
   RAZORPAY_PLAN_ID,
   RAZORPAY_PARTNER_PLAN_ID,
+  CRON_SECRET,
+  FAST2SMS_ROUTE = 'q',
+  FAST2SMS_SENDER = 'FSTSMS',
 } = process.env;
 
 for (const [name, value] of Object.entries({ SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, JWT_SECRET, JWT_REFRESH_SECRET })) {
@@ -64,8 +67,6 @@ const UPLOAD_KINDS = ['profile', 'banner', 'sample', 'tools', 'team', 'partner_s
 const ACCESS_TTL = JWT_ACCESS_EXPIRES_IN;
 const REFRESH_TTL = JWT_REFRESH_EXPIRES_IN;
 const DAILY_LIMITS = { total: 6, image: 3, video: 3 };
-const AUTOPAY_CANCEL_WARNING =
-  'agar aap autopay cancel karte hain to aap interagood partner nahi rahenge na app intergood ue kar paayenge na aapko koi lead milegi';
 
 const app = express();
 app.set('trust proxy', 1);
@@ -178,22 +179,25 @@ const updateUser = async (id, updates) => {
   }
 };
 
-// Home features (samples, online status) are only available while the subscription is active
+// No AutoPay: the subscription is active only while the last monthly payment is valid.
+// A profile is paid while payment_status = 'paid' and its next_due_at has not passed yet.
+const isPaymentActive = (user) =>
+  user.payment_status === 'paid' && (!user.next_due_at || new Date(user.next_due_at).getTime() > Date.now());
+// Home features (samples, online status, business cards) are only available while the payment is active
 const assertActive = async (id) => {
   const user = await getUser(id);
-  if (!user.is_autopay_active) throw new HttpError(402, 'Subscription is not active. Please complete the payment first.');
+  if (!isPaymentActive(user)) throw new HttpError(402, 'Subscription is not active. Please complete the payment first.');
 };
 const requireActive = wrap(async (req, _res, next) => {
   await assertActive(req.params.uuid);
   next();
 });
 
-// ---------- razorpay ----------
+// Monthly one-time plan per role (no AutoPay). Amount is charged once per paid cycle.
 const PLANS = {
-  supplier: { key: 'interagood_supplier_219', name: 'InteraGood Supplier Program', amountPaise: 21900, totalCount: 120, leadsStatus: 'deals_activated' },
-  partner: { key: 'interagood_partner_109', name: 'InteraGood Partner Program', amountPaise: 10900, totalCount: 120, leadsStatus: 'leads_activated' },
+  supplier: { key: 'interagood_supplier_219', name: 'InteraGood Supplier Program', amountPaise: 21900, leadsStatus: 'deals_activated' },
+  partner: { key: 'interagood_partner_109', name: 'InteraGood Partner Program', amountPaise: 10900, leadsStatus: 'leads_activated' },
 };
-const cachedPlanIds = { supplier: RAZORPAY_PLAN_ID || null, partner: RAZORPAY_PARTNER_PLAN_ID || null };
 
 const rzp = async (method, path, body) => {
   if (!RAZORPAY_KEY_ID || !RAZORPAY_KEY_SECRET) throw new HttpError(503, 'Payments are not configured');
@@ -213,29 +217,6 @@ const rzp = async (method, path, body) => {
   return data;
 };
 
-// Monthly plan per role: uses the env plan id if set, otherwise finds or creates it once
-const getPlanId = async (role) => {
-  if (cachedPlanIds[role]) return cachedPlanIds[role];
-  const spec = PLANS[role];
-  const list = await rzp('GET', '/plans?count=100');
-  const existing = list.items?.find((p) => p.notes?.key === spec.key && p.item?.amount === spec.amountPaise);
-  const plan =
-    existing ||
-    (await rzp('POST', '/plans', {
-      period: 'monthly',
-      interval: 1,
-      item: {
-        name: spec.name,
-        description: `Official ${role} subscription for InteraGood platform`,
-        amount: spec.amountPaise,
-        currency: 'INR',
-      },
-      notes: { key: spec.key },
-    }));
-  cachedPlanIds[role] = plan.id;
-  return plan.id;
-};
-
 const safeEqualHex = (a, b) => {
   const x = Buffer.from(String(a || ''), 'utf8');
   const y = Buffer.from(String(b || ''), 'utf8');
@@ -244,7 +225,7 @@ const safeEqualHex = (a, b) => {
 
 const hmacHex = (secret, data) => crypto.createHmac('sha256', secret).update(data).digest('hex');
 
-const activateSubscriber = async (id, subscriptionId) => {
+const activateSubscriber = async (id, reference) => {
   const user = await getUser(id);
   const plan = PLANS[user.role];
   if (!plan) throw new HttpError(403, 'No plan for this role');
@@ -253,12 +234,12 @@ const activateSubscriber = async (id, subscriptionId) => {
   nextDue.setMonth(nextDue.getMonth() + 1);
   await updateUser(id, {
     terms_accepted: true,
-    is_autopay_active: true,
-    autopay_mandate_id: subscriptionId,
     leads_status: plan.leadsStatus,
     payment_status: 'paid',
     last_paid_at: now.toISOString(),
     next_due_at: nextDue.toISOString(),
+    is_online: true,
+    payment_due_date: nextDue.toISOString(),
   });
 };
 
@@ -875,29 +856,28 @@ app.patch(
   }),
 );
 
-// Creates the monthly AutoPay subscription for the user's role (partner Rs 109, supplier Rs 219); the first charge happens at authorization.
+// Creates a one-time monthly payment order (no AutoPay) for the user's role; the first charge happens on this order.
 // Contact and email come from the user's row, never from the client.
 app.post(
-  '/api/users/:uuid/subscription',
+  '/api/users/:uuid/payment/order',
   auth,
   wrap(async (req, res) => {
     const user = await getUser(req.params.uuid);
     const plan = PLANS[user.role];
     if (!plan) throw new HttpError(403, 'No plan available for this role');
-    if (user.is_autopay_active) throw new HttpError(409, 'AutoPay is already active');
+    if (!RAZORPAY_KEY_ID || !RAZORPAY_KEY_SECRET) throw new HttpError(503, 'Payments are not configured');
 
-    const subscription = await rzp('POST', '/subscriptions', {
-      plan_id: await getPlanId(user.role),
-      total_count: plan.totalCount,
-      quantity: 1,
-      customer_notify: 1,
-      notes: { user_id: user.id, role: user.role, phone: normalizePhone(user.phone) },
+    const order = await rzp('POST', '/orders', {
+      amount: plan.amountPaise,
+      currency: 'INR',
+      receipt: `rcpt_${user.id.slice(0, 8)}_${Date.now()}`,
+      notes: { user_id: user.id, role: user.role },
     });
 
     res.json({
       success: true,
       key_id: RAZORPAY_KEY_ID,
-      subscription_id: subscription.id,
+      order_id: order.id,
       amount: plan.amountPaise / 100,
       name: user.full_name || user.business_name || user.username,
       contact: `+91${normalizePhone(user.phone)}`,
@@ -907,28 +887,28 @@ app.post(
   }),
 );
 
-const verifySubscriptionSchema = z.object({
+const verifyPaymentSchema = z.object({
   razorpay_payment_id: z.string().min(1),
-  razorpay_subscription_id: z.string().min(1),
+  razorpay_order_id: z.string().min(1),
   razorpay_signature: z.string().min(1),
 });
 
 app.post(
-  '/api/users/:uuid/subscription/verify',
+  '/api/users/:uuid/payment/verify',
   auth,
   wrap(async (req, res) => {
-    const body = parse(verifySubscriptionSchema, req.body);
+    const body = parse(verifyPaymentSchema, req.body);
     if (!RAZORPAY_KEY_SECRET) throw new HttpError(503, 'Payments are not configured');
 
-    const expected = hmacHex(RAZORPAY_KEY_SECRET, `${body.razorpay_payment_id}|${body.razorpay_subscription_id}`);
+    const expected = hmacHex(RAZORPAY_KEY_SECRET, `${body.razorpay_payment_id}|${body.razorpay_order_id}`);
     if (!safeEqualHex(expected, body.razorpay_signature)) throw new HttpError(400, 'Payment verification failed');
 
-    const subscription = await rzp('GET', `/subscriptions/${encodeURIComponent(body.razorpay_subscription_id)}`);
-    if (subscription.notes?.user_id !== req.params.uuid) throw new HttpError(403, 'Subscription does not belong to this user');
-    if (!['authenticated', 'active'].includes(subscription.status)) throw new HttpError(400, `Subscription is ${subscription.status}`);
+    const order = await rzp('GET', `/orders/${encodeURIComponent(body.razorpay_order_id)}`);
+    if (order.notes?.user_id !== req.params.uuid) throw new HttpError(403, 'Payment does not belong to this user');
+    if (order.status !== 'paid') throw new HttpError(400, 'Payment is not completed');
 
-    await activateSubscriber(req.params.uuid, subscription.id);
-    res.json({ success: true, message: 'AutoPay activated', subscription_id: subscription.id });
+    await activateSubscriber(req.params.uuid, body.razorpay_payment_id);
+    res.json({ success: true, message: 'Payment successful', payment_id: body.razorpay_payment_id });
   }),
 );
 
@@ -983,22 +963,34 @@ app.post(
       throw new HttpError(400, 'Invalid signature');
     }
 
-    const subscription = req.body?.payload?.subscription?.entity;
-    const userId = subscription?.notes?.user_id;
-    if (userId && z.string().uuid().safeParse(userId).success) {
-      const event = req.body.event;
+    const event = req.body.event;
+    // One-time monthly payments (no AutoPay): activate the paid cycle on capture
+    const payment = req.body?.payload?.payment?.entity;
+    const paymentUserId = payment?.notes?.user_id;
+    if (payment && paymentUserId && z.string().uuid().safeParse(paymentUserId).success) {
       try {
-        if (['subscription.activated', 'subscription.charged'].includes(event)) {
-          await activateSubscriber(userId, subscription.id);
-        } else if (['subscription.halted', 'subscription.cancelled', 'subscription.completed', 'subscription.paused'].includes(event)) {
-          await updateUser(userId, {
-            is_autopay_active: false,
+        if (event === 'payment.captured') await activateSubscriber(paymentUserId, payment.id);
+        else if (event === 'payment.failed') {
+          await updateUser(paymentUserId, { leads_status: 'inactive', payment_status: 'failed' });
+        }
+      } catch (err) {
+        if (err.status !== 404) throw err;
+      }
+    }
+
+    // Legacy AutoPay subscription events, kept for safety: a failed/ended mandate makes the user offline
+    const subscription = req.body?.payload?.subscription?.entity;
+    const subscriptionUserId = subscription?.notes?.user_id;
+    if (subscriptionUserId && z.string().uuid().safeParse(subscriptionUserId).success) {
+      try {
+        if (['subscription.halted', 'subscription.cancelled', 'subscription.completed', 'subscription.paused'].includes(event)) {
+          await updateUser(subscriptionUserId, {
             leads_status: 'inactive',
+            is_online: false,
             payment_status: event === 'subscription.halted' ? 'failed' : 'cancelled',
           });
         }
       } catch (err) {
-        // Events for an already deleted account must not make Razorpay retry
         if (err.status !== 404) throw err;
       }
     }
@@ -1028,8 +1020,10 @@ app.get(
 app.patch(
   '/api/users/:uuid/status',
   auth,
-  requireActive,
   wrap(async (req, res) => {
+    const user = await getUser(req.params.uuid);
+    // Online is allowed only while the monthly payment is active
+    if (!isPaymentActive(user)) throw new HttpError(402, 'Subscription is not active. Please complete the payment first.');
     const { is_online } = parse(z.object({ is_online: z.boolean() }), req.body);
     await updateUser(req.params.uuid, { is_online });
     res.json({ success: true, is_online });
@@ -1190,7 +1184,7 @@ app.delete(
 // Card JSON never contains the phone number or coordinates. They are used only on the server to build the
 // call / chat / navigation links, which the client app opens when the matching button is tapped.
 const CARD_COLUMNS =
-  'user_id, business_name, profile_photo_url, banner_url, category_name, is_online, is_autopay_active, latitude, longitude, created_at, users!inner(role, username)';
+  'user_id, business_name, profile_photo_url, banner_url, category_name, is_online, payment_status, next_due_at, latitude, longitude, created_at, users!inner(role, username)';
 const flatCard = ({ user_id, users, created_at, ...rest }) => ({ id: user_id, role: users.role, username: users.username, ...rest });
 const cardContactLimiter = rateLimit({ windowMs: 60 * 60_000, limit: 120, standardHeaders: true, legacyHeaders: false });
 
@@ -1202,18 +1196,27 @@ const distanceKm = (lat1, lon1, lat2, lon2) => {
 };
 
 const toCard = (row, from) => {
-  const { created_at, latitude, longitude, is_autopay_active, ...card } = row;
+  const { created_at, latitude, longitude, payment_status, next_due_at, ...card } = row;
   const hasPoint = latitude != null && longitude != null;
+  const active = isPaymentActive({ payment_status, next_due_at });
   return {
     ...card,
-    verified: is_autopay_active === true,
+    // A user is shown as online only while the monthly payment is active
+    is_online: active && card.is_online === true,
+    verified: active,
     has_location: hasPoint,
     distance_km: from && hasPoint ? Math.round(distanceKm(from.lat, from.lng, Number(latitude), Number(longitude)) * 10) / 10 : null,
   };
 };
 
-// Only subscribed users with a finished business profile are listed
-const listableCards = () => supabase.from('profiles').select(CARD_COLUMNS).eq('is_autopay_active', true).not('business_name', 'is', null);
+// Only paid users with a finished business profile whose monthly cycle has not expired are listed
+const listableCards = () =>
+  supabase
+    .from('profiles')
+    .select(CARD_COLUMNS)
+    .eq('payment_status', 'paid')
+    .or(`next_due_at.is.null,next_due_at.gt.${new Date().toISOString()}`)
+    .not('business_name', 'is', null);
 
 const cardListQuery = z.object({
   role: z.enum(SIGNUP_ROLES).optional(),
@@ -1677,20 +1680,6 @@ app.patch(
 );
 
 // ---------- account ----------
-const TERMINAL_SUBSCRIPTION_STATUSES = ['cancelled', 'completed', 'expired'];
-
-// Stops billing immediately. If Razorpay refuses, deletion must not continue unless the subscription is already over.
-const stopAutopay = async (user) => {
-  const id = user.autopay_mandate_id;
-  if (!id?.startsWith('sub_')) return;
-  try {
-    await rzp('POST', `/subscriptions/${encodeURIComponent(id)}/cancel`, { cancel_at_cycle_end: 0 });
-  } catch (err) {
-    const sub = await rzp('GET', `/subscriptions/${encodeURIComponent(id)}`).catch(() => null);
-    if (!sub || !TERMINAL_SUBSCRIPTION_STATUSES.includes(sub.status)) throw err;
-  }
-};
-
 // Removes every storage file of the user from the user_media folders
 const removeUserMedia = async (userId) => {
   const targets = ['user_media/samples', 'user_media/profilephoto', 'user_media/banner'].map(
@@ -1712,21 +1701,11 @@ const removeUserMedia = async (userId) => {
   }
 };
 
-// Cancels the subscription, deletes all uploaded files, then the user row (samples cascade)
+// Deletes all uploaded files, then the user row (samples cascade)
 const deleteAccount = async (id) => {
-  const user = await getUser(id);
-  await stopAutopay(user);
   await removeUserMedia(id);
   db(await supabase.from('users').delete().eq('id', id));
 };
-app.post(
-  '/api/users/:uuid/cancel-autopay',
-  auth,
-  wrap(async (req, res) => {
-    await deleteAccount(req.params.uuid);
-    res.json({ success: true, message: 'AutoPay cancelled and account deleted', warning: AUTOPAY_CANCEL_WARNING });
-  }),
-);
 
 app.delete(
   '/api/users/:uuid',
@@ -1734,6 +1713,55 @@ app.delete(
   wrap(async (req, res) => {
     await deleteAccount(req.params.uuid);
     res.json({ success: true, message: 'Account deleted' });
+  }),
+);
+
+// ---------- monthly payment reminders ----------
+// No AutoPay: each month the user is notified before their paid cycle ends.
+// Call this from an external scheduler (cron-job.org / GitHub Action / Railway cron) once a day:
+//   GET /api/cron/payment-reminders?token=<CRON_SECRET>
+const sendSms = async (phone, message) => {
+  if (!FAST2SMS_API_KEY) return false;
+  try {
+    const res = await fetch('https://www.fast2sms.com/dev/bulkV2', {
+      method: 'POST',
+      headers: { authorization: FAST2SMS_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ route: FAST2SMS_ROUTE, sender_id: FAST2SMS_SENDER, message, flash: 0, numbers: String(phone) }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) console.error('[fast2sms] reminder', res.status, data.message);
+    return res.ok;
+  } catch (err) {
+    console.error('[fast2sms] reminder', err.message);
+    return false;
+  }
+};
+
+app.get(
+  '/api/cron/payment-reminders',
+  wrap(async (req, res) => {
+    const token = req.query.token || req.get('x-cron-secret');
+    if (!CRON_SECRET || token !== CRON_SECRET) throw new HttpError(401, 'Unauthorized');
+    const now = new Date();
+    const soon = new Date(now.getTime() + 7 * 86400_000).toISOString();
+    const rows = db(
+      await supabase
+        .from('profiles')
+        .select('user_id, next_due_at, users!inner(role, phone, full_name, business_name)')
+        .eq('payment_status', 'paid')
+        .lte('next_due_at', soon)
+        .gt('next_due_at', now.toISOString()),
+    );
+    let notified = 0;
+    for (const r of rows) {
+      const phone = r.users?.phone;
+      if (!phone) continue;
+      const amount = PLANS[r.users.role] ? PLANS[r.users.role].amountPaise / 100 : '';
+      const date = new Date(r.next_due_at).toLocaleDateString('en-IN');
+      await sendSms(phone, `InteraGood: your ${r.users.role} plan (Rs ${amount}) is due on ${date}. Pay in the app to stay online.`);
+      notified += 1;
+    }
+    res.json({ success: true, due: rows.length, notified });
   }),
 );
 
