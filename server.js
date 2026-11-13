@@ -71,7 +71,8 @@ const UPLOAD_KINDS = ['profile', 'banner', 'sample', 'tools', 'team', 'partner_s
 
 const ACCESS_TTL = JWT_ACCESS_EXPIRES_IN;
 const REFRESH_TTL = JWT_REFRESH_EXPIRES_IN;
-const DAILY_LIMITS = { total: 4, image: 2, video: 2 };
+const DAILY_LIMITS = { total: 6, image: 3, video: 3 };
+const PRODUCT_DAILY_LIMIT = 4;
 
 const app = express();
 app.set('trust proxy', 1);
@@ -196,7 +197,8 @@ const assertActive = async (id) => {
   if (!isPaymentActive(user)) throw new HttpError(402, 'Subscription is not active. Please complete the payment first.');
 };
 const requireActive = wrap(async (req, _res, next) => {
-  await assertActive(req.params.uuid);
+  const liveBilling = isPayuConfigured() || (!!RAZORPAY_KEY_ID && !!RAZORPAY_KEY_SECRET);
+  if (liveBilling) await assertActive(req.params.uuid);
   next();
 });
 
@@ -456,7 +458,18 @@ app.post(
     if (!user || !(await bcrypt.compare(password, user.password_hash))) {
       throw new HttpError(401, 'Invalid credentials');
     }
-    res.json({ success: true, uuid: user.id, role: user.role, username: user.username, ...signTokens(user) });
+    const fullUser = await getUser(user.id).catch(() => null);
+    res.json({
+      success: true,
+      uuid: user.id,
+      role: user.role,
+      username: user.username,
+      payment_status: fullUser?.payment_status || "unpaid",
+      is_online: !!fullUser?.is_online,
+      profile_completed: !!fullUser?.business_name,
+      profile: fullUser ? sanitizeUser(fullUser) : null,
+      ...signTokens(user),
+    });
   }),
 );
 
@@ -1281,6 +1294,7 @@ const listingSchema = z.object({
   unit: z.string().trim().max(30).default('sqft'),
   rate_per_unit: z.coerce.number().min(0).max(100_000_000).default(0),
   quantity: z.coerce.number().min(0.01).max(1_000_000).default(1),
+  expected_amount: z.coerce.number().min(0).max(100_000_000).optional().nullable(),
   with_material: z.boolean().optional().default(true),
   image_url: z.string().url().optional().nullable(),
   media_type: z.enum(['image', 'video']).default('image'),
@@ -1289,22 +1303,31 @@ const listingSchema = z.object({
 
 const getQuotaForUser = async (userId) => {
   const since = startOfTodayIST();
-  let rows = [];
-  const res1 = await supabase.from('product_listings').select('media_type').eq('user_id', userId).gte('created_at', since);
-  if (!res1.error && res1.data) rows = res1.data;
-  else {
-    const res2 = await supabase.from('user_samples').select('media_type').eq('user_id', userId).gte('created_at', since);
-    if (!res2.error && res2.data) rows = res2.data;
-  }
-  const imagesUsed = rows.filter((r) => r.media_type === 'image').length;
-  const videosUsed = rows.filter((r) => r.media_type === 'video').length;
+  const sampleRes = await supabase.from('user_samples').select('media_type').eq('user_id', userId).gte('created_at', since);
+  const sampleRows = (!sampleRes.error && sampleRes.data) ? sampleRes.data : [];
+  const prodRes = await supabase.from('product_listings').select('id').eq('user_id', userId).gte('created_at', since);
+  const prodRows = (!prodRes.error && prodRes.data) ? prodRes.data : [];
+  const imagesUsed = sampleRows.filter((r) => r.media_type === 'image').length;
+  const videosUsed = sampleRows.filter((r) => r.media_type === 'video').length;
   return {
-    totalUsed: rows.length,
+    totalUsed: sampleRows.length,
     imagesUsed,
     videosUsed,
     maxTotal: DAILY_LIMITS.total,
     maxImages: DAILY_LIMITS.image,
     maxVideos: DAILY_LIMITS.video,
+    samples: {
+      totalUsed: sampleRows.length,
+      imagesUsed,
+      videosUsed,
+      maxTotal: DAILY_LIMITS.total,
+      maxImages: DAILY_LIMITS.image,
+      maxVideos: DAILY_LIMITS.video,
+    },
+    products: {
+      totalUsed: prodRows.length,
+      maxTotal: PRODUCT_DAILY_LIMIT,
+    },
   };
 };
 
@@ -1921,6 +1944,60 @@ app.get(
         .limit(30),
     );
     res.json({ success: true, data: rows });
+  }),
+);
+
+// ---------- assigned orders for Partner / Supplier / Architect ----------
+app.get(
+  '/api/users/:uuid/orders',
+  auth,
+  wrap(async (req, res) => {
+    const rows = db(
+      await supabase
+        .from('order_assignments')
+        .select('id, order_id, work_type, status, assigned_at, created_at, cart_requests(order_no, location_name, status, created_at)')
+        .eq('partner_id', req.params.uuid)
+        .order('created_at', { ascending: false })
+        .limit(100),
+    );
+    const mapped = rows.map((r) => ({
+      id: r.id,
+      order_id: r.order_id,
+      order_no: r.cart_requests?.order_no || null,
+      location_name: r.cart_requests?.location_name || 'Client Site',
+      work_type: r.work_type,
+      status: r.status === 'assigned' ? 'pending' : r.status,
+      assigned_at: r.assigned_at || r.created_at,
+    }));
+    res.json({ success: true, data: mapped });
+  }),
+);
+
+app.patch(
+  '/api/users/:uuid/orders/:assignmentId',
+  auth,
+  wrap(async (req, res) => {
+    const { status } = parse(z.object({ status: z.enum(['pending', 'in_progress', 'completed']) }), req.body);
+    const dbStatus = status === 'pending' ? 'assigned' : status;
+    const upd = await supabase
+      .from('order_assignments')
+      .update({ status: dbStatus })
+      .eq('id', req.params.assignmentId)
+      .eq('partner_id', req.params.uuid)
+      .select('id, status')
+      .maybeSingle();
+    if (upd.error) {
+      // Fallback if DB check constraint hasn't added in_progress yet
+      const fbStatus = status === 'completed' ? 'completed' : 'assigned';
+      db(
+        await supabase
+          .from('order_assignments')
+          .update({ status: fbStatus })
+          .eq('id', req.params.assignmentId)
+          .eq('partner_id', req.params.uuid),
+      );
+    }
+    res.json({ success: true, status });
   }),
 );
 

@@ -26,14 +26,18 @@ BEGIN
   END IF;
 END $$;
 
--- Track private flag on existing user_samples for partner skill evaluation
+-- Track private flag & owner snapshot fields on user_samples
 ALTER TABLE user_samples
   ADD COLUMN IF NOT EXISTS is_private BOOLEAN NOT NULL DEFAULT FALSE,
   ADD COLUMN IF NOT EXISTS category VARCHAR(100),
   ADD COLUMN IF NOT EXISTS sub_category VARCHAR(100),
-  ADD COLUMN IF NOT EXISTS with_material BOOLEAN NOT NULL DEFAULT TRUE;
+  ADD COLUMN IF NOT EXISTS with_material BOOLEAN NOT NULL DEFAULT TRUE,
+  ADD COLUMN IF NOT EXISTS role VARCHAR(20),
+  ADD COLUMN IF NOT EXISTS phone VARCHAR(20),
+  ADD COLUMN IF NOT EXISTS username VARCHAR(60),
+  ADD COLUMN IF NOT EXISTS business_name VARCHAR(150);
 
--- Product & Post Listings table for Suppliers (independent hardware/materials), Architects (designs/structures) & Partners (private samples)
+-- Product & Post Listings table for Suppliers, Architects & Partners
 CREATE TABLE IF NOT EXISTS product_listings (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -45,6 +49,7 @@ CREATE TABLE IF NOT EXISTS product_listings (
   unit VARCHAR(30) NOT NULL DEFAULT 'sqft',
   rate_per_unit NUMERIC(10, 2) NOT NULL DEFAULT 0,
   quantity NUMERIC(10, 2) NOT NULL DEFAULT 1,
+  expected_amount NUMERIC(12, 2) NOT NULL DEFAULT 0,
   total_amount NUMERIC(12, 2) NOT NULL DEFAULT 0,
   with_material BOOLEAN DEFAULT TRUE,
   image_url TEXT,
@@ -54,6 +59,8 @@ CREATE TABLE IF NOT EXISTS product_listings (
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+ALTER TABLE product_listings ADD COLUMN IF NOT EXISTS expected_amount NUMERIC(12, 2) NOT NULL DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS idx_product_listings_public ON product_listings (role, is_active, is_private, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_product_listings_user ON product_listings (user_id, created_at DESC);
@@ -107,5 +114,15 @@ BEGIN
     CREATE POLICY "Users can manage their own listings"
       ON product_listings FOR ALL
       USING (auth.uid() = user_id);
+  END IF;
+END $$;
+
+-- Allow 'in_progress' status on order_assignments for Order tab (Pending / In Progress / Completed)
+DO $$
+BEGIN
+  IF to_regclass('public.order_assignments') IS NOT NULL THEN
+    ALTER TABLE order_assignments DROP CONSTRAINT IF EXISTS order_assignments_status_check;
+    ALTER TABLE order_assignments ADD CONSTRAINT order_assignments_status_check
+      CHECK (status IN ('unassigned', 'assigned', 'in_progress', 'completed', 'cancelled'));
   END IF;
 END $$;
