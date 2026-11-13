@@ -1776,19 +1776,12 @@ app.get(
   publicLimiter,
   wrap(async (req, res) => {
     const roleFilter = req.query.role ? String(req.query.role) : null;
-    let profRes = await supabase
+    const profRes = await supabase
       .from('profiles')
-      .select('user_id, business_name, profile_photo_url, banner_url, category_name, skill_level, is_online, payment_status, city, users!inner(role, username, phone)')
+      .select('*, users!inner(role, username, phone)')
       .not('business_name', 'is', null)
       .limit(200);
-    if (profRes.error && isMissingSchemaErr(profRes.error)) {
-      profRes = await supabase
-        .from('profiles')
-        .select('user_id, business_name, profile_photo_url, banner_url, category_name, is_online, payment_status, city, users!inner(role, username, phone)')
-        .not('business_name', 'is', null)
-        .limit(200);
-    }
-    const profiles = db(profRes);
+    const profiles = (!profRes.error && profRes.data) ? profRes.data : [];
     const byUser = new Map();
     profiles.forEach((p) => {
       const u = p.users || {};
@@ -1821,7 +1814,8 @@ app.get(
     if (!res1.error && res1.data) {
       listings = res1.data;
     } else {
-      const fb = db(await supabase.from('user_samples').select('id, user_id, media_type, title, caption, media_url, price, price_unit, created_at').order('created_at', { ascending: false }).limit(120)).filter((r) => isProductFallbackCaption(r.caption));
+      const fbRes = await supabase.from('user_samples').select('*').order('created_at', { ascending: false }).limit(120);
+      const fb = (!fbRes.error && fbRes.data) ? fbRes.data.filter((r) => isProductFallbackCaption(r.caption)) : [];
       listings = fb.map((s) => {
         let meta = {};
         try { if (s.caption && s.caption.startsWith('{')) meta = JSON.parse(s.caption); } catch {}
@@ -1833,12 +1827,13 @@ app.get(
           title: s.title,
           category: meta.category || creator?.category_name || 'General',
           sub_category: meta.sub_category || null,
-          description: meta.description || (s.caption && !s.caption.startsWith('{') ? s.caption : ''),
-          unit: meta.unit || s.price_unit || 'sqft',
+          description: meta.description || '',
+          unit: meta.unit || s.price_unit || 'sqfit',
           rate_per_unit: Number(s.price) || 0,
           quantity: Number(meta.quantity) || 1,
+          expected_amount: Number(meta.expected_amount) || Number(meta.total_amount) || Number(s.price) || 0,
           total_amount: Number(meta.total_amount) || Number(s.price) || 0,
-          with_material: meta.with_material !== false,
+          with_material: meta.with_material === true,
           image_url: s.media_url,
           media_type: s.media_type,
           is_private: !!meta.is_private,
