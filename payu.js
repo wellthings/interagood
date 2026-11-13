@@ -1,14 +1,16 @@
-// PayU payment gateway module (placeholder).
-// Configure live keys in env vars: PAYU_KEY, PAYU_SALT, PAYU_MODE (test|live).
-// With keys set this enables live processing; without them the endpoints return
-// a 503 so callers know the gateway is not configured yet.
+// PayU payment gateway.
+// Reads the merchant key/salt from either the classic names (PAYU_KEY/PAYU_SALT) or the
+// dashboard names (PAYU_MERCHANT_KEY/PAYU_MERCHANT_SALT). PAYU_BASE_URL can point at the
+// full payment endpoint (e.g. https://secure.payu.in/_payment) or be left empty to derive
+// it from PAYU_MODE (test|live).
 
 import crypto from 'node:crypto';
 
-const PAYU_KEY = process.env.PAYU_KEY || '';
-const PAYU_SALT = process.env.PAYU_SALT || '';
+const PAYU_KEY = process.env.PAYU_MERCHANT_KEY || process.env.PAYU_KEY || '';
+const PAYU_SALT = process.env.PAYU_MERCHANT_SALT || process.env.PAYU_SALT || '';
 const PAYU_MODE = process.env.PAYU_MODE || 'test';
 const PAYU_BASE = PAYU_MODE === 'live' ? 'https://secure.payu.in' : 'https://test.payu.in';
+const PAYU_ENDPOINT = process.env.PAYU_BASE_URL || `${PAYU_BASE}/_payment`;
 
 export const isPayuConfigured = () => Boolean(PAYU_KEY && PAYU_SALT);
 
@@ -64,7 +66,7 @@ export const buildPayuOrder = ({ txnid, amount, productinfo, firstname, email, p
     udf5: udf5 || '',
   };
   base.hash = makePayuHash(base);
-  return { action: `${PAYU_BASE}/_payment`, method: 'POST', fields: base };
+  return { action: PAYU_ENDPOINT, method: 'POST', fields: base };
 };
 
 // Deep-link URL variant (used by mobile apps) - returns the redirect URL with hash.
