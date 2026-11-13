@@ -118,6 +118,31 @@ const resolveSampleUrls = async (samples) => {
     return item;
   }));
 };
+const isMissingTableErr = (err) => {
+  if (!err) return false;
+  const msg = String(err.message || "") + " " + String(err.details || "");
+  return err.code === "42P01" || err.code === "PGRST205" || /relation .* does not exist|could not find the table/i.test(msg);
+};
+const loadStoreRecords = async (userId) => {
+  const path = `user_media/records/${userId}.json`;
+  const { data, error } = await supabase.storage.from(STORAGE_BUCKET).download(path);
+  if (error || !data) return { samples: [], products: [] };
+  try {
+    const txt = await data.text();
+    const parsed = JSON.parse(txt);
+    return {
+      samples: Array.isArray(parsed.samples) ? parsed.samples : [],
+      products: Array.isArray(parsed.products) ? parsed.products : [],
+    };
+  } catch {
+    return { samples: [], products: [] };
+  }
+};
+const saveStoreRecords = async (userId, records) => {
+  const path = `user_media/records/${userId}.json`;
+  const body = Buffer.from(JSON.stringify(records), "utf8");
+  await supabase.storage.from(STORAGE_BUCKET).upload(path, body, { contentType: "application/json", upsert: true });
+};
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 class HttpError extends Error {
@@ -289,6 +314,19 @@ const startOfTodayIST = () => {
 // ---------- health ----------
 app.get('/', (_req, res) => res.json({ service: 'interagood-backend', status: 'ok' }));
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+app.get('/api/health', wrap(async (_req, res) => {
+  const bucketsRes = await supabase.storage.listBuckets();
+  const buckets = (!bucketsRes.error && bucketsRes.data) ? bucketsRes.data.map((b) => ({ id: b.id, public: b.public })) : [];
+  const checkTable = async (t) => {
+    const r = await supabase.from(t).select('*').limit(1);
+    return r.error ? { exists: false, code: r.error.code || null, message: r.error.message } : { exists: true };
+  };
+  const tables = {};
+  for (const t of ['users', 'profiles', 'user_samples', 'product_listings', 'partner_categories', 'supplier_categories', 'order_assignments']) {
+    tables[t] = await checkTable(t);
+  }
+  res.json({ status: 'ok', buckets, tables });
+}));
 
 // ---------- auth ----------
 app.get(
@@ -1091,13 +1129,16 @@ app.get(
   auth,
   wrap(async (req, res) => {
     const user = await getUser(req.params.uuid);
-    const rawSamples = db(
-      await supabase
-        .from('user_samples')
-        .select(SAMPLE_COLUMNS)
-        .eq('user_id', user.id)
-        .order('created_at', { ascending: false }),
-    ).filter((row) => !isProductFallbackCaption(row.caption));
+    let smpRes = await supabase.from('user_samples').select('*').eq('user_id', user.id).order('created_at', { ascending: false });
+    let rawSamples = [];
+    if (!smpRes.error && smpRes.data) {
+      rawSamples = smpRes.data.filter((row) => !isProductFallbackCaption(row.caption));
+    } else if (smpRes.error && isMissingTableErr(smpRes.error)) {
+      const storeRec = await loadStoreRecords(user.id);
+      rawSamples = storeRec.samples;
+    } else if (smpRes.error) {
+      db(smpRes);
+    }
     const samples = await resolveSampleUrls(await withVotes(rawSamples, user.id));
     res.json({ success: true, data: { ...sanitizeUser(user), samples } });
   }),
@@ -1200,7 +1241,6 @@ app.post(
 const SAMPLE_COLUMNS = 'id, media_type, title, caption, media_url, thumbnail_url, price, price_unit, created_at';
 const PRICE_UNITS = ['inch', 'sqfit', 'sqft', 'runningfit', 'rft', 'pcs', 'pieces', 'bundle', 'bundles', 'combo', 'fit', 'feet', 'meter', 'kg', 'liter', 'liters', 'contract'];
 
-// Adds likes / dislikes counts and the viewer's own vote (1, -1 or 0) to each sample
 const withVotes = async (samples, viewerId) => {
   if (!samples.length) return samples;
   const votesRes = await supabase.from('sample_votes').select('sample_id, user_id, vote').in('sample_id', samples.map((s) => s.id));
@@ -1236,13 +1276,20 @@ app.get(
   auth,
   wrap(async (req, res) => {
     const quota = await getQuotaForUser(req.params.uuid);
-    const raw = db(
-      await supabase
-        .from('user_samples')
-        .select(SAMPLE_COLUMNS)
-        .eq('user_id', req.params.uuid)
-        .order('created_at', { ascending: false }),
-    ).filter((row) => !isProductFallbackCaption(row.caption));
+    const q = await supabase
+      .from('user_samples')
+      .select('*')
+      .eq('user_id', req.params.uuid)
+      .order('created_at', { ascending: false });
+    let raw = [];
+    if (!q.error && q.data) {
+      raw = q.data.filter((row) => !isProductFallbackCaption(row.caption));
+    } else if (q.error && isMissingTableErr(q.error)) {
+      const storeRec = await loadStoreRecords(req.params.uuid);
+      raw = storeRec.samples;
+    } else {
+      db(q);
+    }
     const samples = await resolveSampleUrls(await withVotes(raw, req.params.uuid));
     res.json({ success: true, data: samples, quota });
   }),
@@ -1255,29 +1302,25 @@ app.post(
   wrap(async (req, res) => {
     const user = await getUser(req.params.uuid);
     const body = parse(sampleSchema, req.body);
-    const todayRaw = db(
-      await supabase
-        .from('user_samples')
-        .select('media_type, caption')
-        .eq('user_id', req.params.uuid)
-        .gte('created_at', startOfTodayIST()),
-    );
-    const today = todayRaw.filter((s) => !isProductFallbackCaption(s.caption));
-    if (today.length >= DAILY_LIMITS.total) {
+    const quota = await getQuotaForUser(user.id);
+    if (quota.samples.totalUsed >= DAILY_LIMITS.total) {
       throw new HttpError(429, `Daily limit of ${DAILY_LIMITS.total} samples reached for today.`);
     }
-    const sameType = today.filter((s) => s.media_type === body.media_type).length;
+    const sameType = body.media_type === 'video' ? quota.samples.videosUsed : quota.samples.imagesUsed;
     if (sameType >= DAILY_LIMITS[body.media_type]) {
       throw new HttpError(429, `Daily maximum of ${DAILY_LIMITS[body.media_type]} ${body.media_type}s reached.`);
     }
     const safePrice = body.price > 0 ? body.price : 1;
     const safeUnit = UNIT_TO_SAMPLE_UNIT[String(body.price_unit || 'pcs').toLowerCase()] || 'pcs';
-    const baseRow = {
+    const minimalRow = {
       user_id: req.params.uuid,
       media_type: body.media_type,
       title: body.title,
-      caption: body.caption || null,
       media_url: body.media_url,
+    };
+    const baseRow = {
+      ...minimalRow,
+      caption: body.caption || null,
       thumbnail_url: body.thumbnail_url ?? null,
       price: safePrice,
       price_unit: safeUnit,
@@ -1291,17 +1334,37 @@ app.post(
       business_name: body.business_name || user.business_name || null,
     };
 
-    let insRes = await supabase.from('user_samples').insert(extendedRow).select(SAMPLE_COLUMNS).single();
-    if (insRes.error && isMissingSchemaErr(insRes.error)) {
-      insRes = await supabase.from('user_samples').insert(baseRow).select(SAMPLE_COLUMNS).single();
+    let insRes = await supabase.from('user_samples').insert(extendedRow).select('*').single();
+    if (insRes.error && isMissingSchemaErr(insRes.error) && !isMissingTableErr(insRes.error)) {
+      insRes = await supabase.from('user_samples').insert(baseRow).select('*').single();
     }
-    const sample = db(insRes);
+    if (insRes.error && isMissingSchemaErr(insRes.error) && !isMissingTableErr(insRes.error)) {
+      insRes = await supabase.from('user_samples').insert(minimalRow).select('*').single();
+    }
+
+    let sample;
+    if (!insRes.error && insRes.data) {
+      sample = insRes.data;
+    } else if (insRes.error && isMissingTableErr(insRes.error)) {
+      sample = {
+        id: crypto.randomUUID(),
+        ...extendedRow,
+        created_at: new Date().toISOString(),
+      };
+      const storeRec = await loadStoreRecords(user.id);
+      storeRec.samples.unshift(sample);
+      await saveStoreRecords(user.id, storeRec);
+    } else {
+      sample = db(insRes);
+    }
+
     const [resolved] = await resolveSampleUrls([sample]);
-    const quota = await getQuotaForUser(user.id);
+    const nextQuota = await getQuotaForUser(user.id);
     res.status(201).json({
       success: true,
       data: {
         ...resolved,
+        caption: resolved.caption ?? body.caption ?? '',
         role: extendedRow.role,
         phone: extendedRow.phone,
         username: extendedRow.username,
@@ -1311,7 +1374,7 @@ app.post(
         dislikes: 0,
         my_vote: 0,
       },
-      quota,
+      quota: nextQuota,
     });
   }),
 );
@@ -1322,7 +1385,7 @@ app.put(
   wrap(async (req, res) => {
     if (!z.string().uuid().safeParse(req.params.sampleId).success) throw new HttpError(400, 'Invalid sample id');
     const { vote } = parse(z.object({ vote: z.union([z.literal(1), z.literal(-1), z.literal(0)]) }), req.body);
-    const sample = db(await supabase.from('user_samples').select(SAMPLE_COLUMNS).eq('id', req.params.sampleId).maybeSingle());
+    const sample = db(await supabase.from('user_samples').select('*').eq('id', req.params.sampleId).maybeSingle());
     if (!sample) throw new HttpError(404, 'Sample not found');
     if (vote === 0) {
       db(await supabase.from('sample_votes').delete().eq('sample_id', sample.id).eq('user_id', req.params.uuid));
@@ -1339,9 +1402,14 @@ app.delete(
   auth,
   wrap(async (req, res) => {
     if (!z.string().uuid().safeParse(req.params.sampleId).success) throw new HttpError(400, 'Invalid sample id');
-    const deleted = db(
-      await supabase.from('user_samples').delete().eq('id', req.params.sampleId).eq('user_id', req.params.uuid).select('media_url'),
-    );
+    const delRes = await supabase.from('user_samples').delete().eq('id', req.params.sampleId).eq('user_id', req.params.uuid).select('media_url');
+    if (delRes.error && isMissingTableErr(delRes.error)) {
+      const storeRec = await loadStoreRecords(req.params.uuid);
+      storeRec.samples = storeRec.samples.filter((s) => s.id !== req.params.sampleId);
+      await saveStoreRecords(req.params.uuid, storeRec);
+      return res.json({ success: true, message: 'Sample deleted' });
+    }
+    const deleted = db(delRes);
     const marker = `/object/public/${STORAGE_BUCKET}/`;
     const paths = deleted.map((s) => String(s.media_url || '').split(marker)[1]).filter(Boolean).map(decodeURIComponent);
     if (paths.length) {
@@ -1388,10 +1456,17 @@ const listingSchema = z.object({
 
 const getQuotaForUser = async (userId) => {
   const since = startOfTodayIST();
-  const sampleRes = await supabase.from('user_samples').select('media_type, caption').eq('user_id', userId).gte('created_at', since);
-  const allSampleRows = (!sampleRes.error && sampleRes.data) ? sampleRes.data : [];
-  const sampleRows = allSampleRows.filter((r) => !isProductFallbackCaption(r.caption));
-  const fallbackProdRows = allSampleRows.filter((r) => isProductFallbackCaption(r.caption));
+  const sampleRes = await supabase.from('user_samples').select('*').eq('user_id', userId).gte('created_at', since);
+  let sampleRows = [];
+  let fallbackProdRows = [];
+  if (!sampleRes.error && sampleRes.data) {
+    sampleRows = sampleRes.data.filter((r) => !isProductFallbackCaption(r.caption));
+    fallbackProdRows = sampleRes.data.filter((r) => isProductFallbackCaption(r.caption));
+  } else if (sampleRes.error && isMissingTableErr(sampleRes.error)) {
+    const storeRec = await loadStoreRecords(userId);
+    sampleRows = storeRec.samples.filter((r) => !r.created_at || r.created_at >= since);
+    fallbackProdRows = storeRec.products.filter((r) => !r.created_at || r.created_at >= since);
+  }
   const prodRes = await supabase.from('product_listings').select('id').eq('user_id', userId).gte('created_at', since);
   const prodCount = (!prodRes.error && prodRes.data) ? prodRes.data.length : fallbackProdRows.length;
   const imagesUsed = sampleRows.filter((r) => r.media_type === 'image').length;
@@ -1430,34 +1505,39 @@ app.get(
       .order('created_at', { ascending: false });
     if (!error) return res.json({ success: true, data, quota });
 
-    const fallback = db(
-      await supabase.from('user_samples').select(SAMPLE_COLUMNS).eq('user_id', req.params.uuid).order('created_at', { ascending: false }),
-    );
-    const mapped = fallback
-      .filter((s) => isProductFallbackCaption(s.caption))
-      .map((s) => {
-        let meta = {};
-        try { meta = JSON.parse(s.caption); } catch {}
-        return {
-          id: s.id,
-          user_id: req.params.uuid,
-          title: s.title,
-          category: meta.category || 'General',
-          sub_category: meta.sub_category || null,
-          description: meta.description || '',
-          unit: meta.unit || s.price_unit || 'sqfit',
-          rate_per_unit: Number(s.price) || 0,
-          quantity: Number(meta.quantity) || 1,
-          expected_amount: Number(meta.expected_amount) || Number(meta.total_amount) || Number(s.price) || 0,
-          total_amount: Number(meta.total_amount) || Number(s.price) || 0,
-          with_material: meta.with_material === true,
-          image_url: s.media_url,
-          media_type: s.media_type || 'image',
-          is_private: !!meta.is_private,
-          created_at: s.created_at,
-        };
-      });
-    res.json({ success: true, data: mapped, quota });
+    const fbRes = await supabase.from('user_samples').select('*').eq('user_id', req.params.uuid).order('created_at', { ascending: false });
+    if (!fbRes.error && fbRes.data) {
+      const mapped = fbRes.data
+        .filter((s) => isProductFallbackCaption(s.caption))
+        .map((s) => {
+          let meta = {};
+          try { meta = JSON.parse(s.caption); } catch {}
+          return {
+            id: s.id,
+            user_id: req.params.uuid,
+            title: s.title,
+            category: meta.category || 'General',
+            sub_category: meta.sub_category || null,
+            description: meta.description || '',
+            unit: meta.unit || s.price_unit || 'sqfit',
+            rate_per_unit: Number(s.price) || 0,
+            quantity: Number(meta.quantity) || 1,
+            expected_amount: Number(meta.expected_amount) || Number(meta.total_amount) || Number(s.price) || 0,
+            total_amount: Number(meta.total_amount) || Number(s.price) || 0,
+            with_material: meta.with_material === true,
+            image_url: s.media_url,
+            media_type: s.media_type || 'image',
+            is_private: !!meta.is_private,
+            created_at: s.created_at,
+          };
+        });
+      return res.json({ success: true, data: mapped, quota });
+    }
+    if (fbRes.error && isMissingTableErr(fbRes.error)) {
+      const storeRec = await loadStoreRecords(req.params.uuid);
+      return res.json({ success: true, data: storeRec.products, quota });
+    }
+    db(fbRes);
   }),
 );
 
@@ -1499,7 +1579,7 @@ app.post(
       .insert({ ...baseListing, expected_amount: expectedAmt })
       .select('*')
       .single();
-    if (insRes.error && isMissingSchemaErr(insRes.error)) {
+    if (insRes.error && isMissingSchemaErr(insRes.error) && !isMissingTableErr(insRes.error)) {
       insRes = await supabase.from('product_listings').insert(baseListing).select('*').single();
     }
 
@@ -1510,57 +1590,75 @@ app.post(
     // Fallback to user_samples ONLY if product_listings table does not exist yet
     const sampleUnit = UNIT_TO_SAMPLE_UNIT[b.unit.toLowerCase()] || 'sqfit';
     const safePrice = b.rate_per_unit > 0 ? b.rate_per_unit : 1;
-    const metaCaption = JSON.stringify({
+    const metaObj = {
       __kind: 'product',
-      category: b.category,
-      sub_category: b.sub_category || null,
-      description: (b.description || '').slice(0, 120),
-      unit: b.unit,
+      category: String(b.category || 'General').slice(0, 32),
+      description: String(b.description || '').slice(0, 90),
+      unit: String(b.unit || 'sqfit').slice(0, 16),
       quantity: b.quantity,
       expected_amount: expectedAmt,
       total_amount: expectedAmt || subtotal,
       with_material: withMaterial,
       is_private: isPrivate,
-    }).slice(0, 295);
+    };
+    const metaCaption = JSON.stringify(metaObj);
 
-    const fb = db(
-      await supabase
-        .from('user_samples')
-        .insert({
-          user_id: user.id,
-          media_type: b.media_type,
-          title: b.title.slice(0, 120),
-          caption: metaCaption,
-          media_url: b.image_url || 'https://interagood.in/assets/logo-square.png',
-          price: safePrice,
-          price_unit: sampleUnit,
-        })
-        .select(SAMPLE_COLUMNS)
-        .single(),
-    );
-    res.status(201).json({
-      success: true,
-      data: {
-        id: fb.id,
+    const fbIns = await supabase
+      .from('user_samples')
+      .insert({
         user_id: user.id,
-        role: user.role,
-        title: fb.title,
-        category: b.category,
-        sub_category: b.sub_category || null,
-        description: b.description || '',
-        unit: b.unit,
-        rate_per_unit: b.rate_per_unit,
-        quantity: b.quantity,
+        media_type: b.media_type,
+        title: b.title.slice(0, 120),
+        caption: metaCaption.slice(0, 295),
+        media_url: b.image_url || 'https://interagood.in/assets/logo-square.png',
+        price: safePrice,
+        price_unit: sampleUnit,
+      })
+      .select('*')
+      .single();
+
+    if (!fbIns.error && fbIns.data) {
+      const fb = fbIns.data;
+      return res.status(201).json({
+        success: true,
+        data: {
+          id: fb.id,
+          user_id: user.id,
+          role: user.role,
+          title: fb.title,
+          category: b.category,
+          sub_category: b.sub_category || null,
+          description: b.description || '',
+          unit: b.unit,
+          rate_per_unit: b.rate_per_unit,
+          quantity: b.quantity,
+          expected_amount: expectedAmt,
+          total_amount: expectedAmt || subtotal,
+          with_material: withMaterial,
+          image_url: fb.media_url,
+          media_type: fb.media_type,
+          is_private: isPrivate,
+          created_at: fb.created_at,
+        },
+        quota: await getQuotaForUser(user.id),
+      });
+    }
+
+    if (fbIns.error && isMissingTableErr(fbIns.error)) {
+      const item = {
+        id: crypto.randomUUID(),
+        ...baseListing,
         expected_amount: expectedAmt,
-        total_amount: expectedAmt || subtotal,
-        with_material: withMaterial,
-        image_url: fb.media_url,
-        media_type: fb.media_type,
-        is_private: isPrivate,
-        created_at: fb.created_at,
-      },
-      quota: await getQuotaForUser(user.id),
-    });
+        description: b.description || '',
+        image_url: b.image_url || 'https://interagood.in/assets/logo-square.png',
+        created_at: new Date().toISOString(),
+      };
+      const storeRec = await loadStoreRecords(user.id);
+      storeRec.products.unshift(item);
+      await saveStoreRecords(user.id, storeRec);
+      return res.status(201).json({ success: true, data: item, quota: await getQuotaForUser(user.id) });
+    }
+    db(fbIns);
   }),
 );
 
@@ -1571,7 +1669,12 @@ app.delete(
     if (!z.string().uuid().safeParse(req.params.listingId).success) throw new HttpError(400, 'Invalid listing id');
     const res1 = await supabase.from('product_listings').delete().eq('id', req.params.listingId).eq('user_id', req.params.uuid);
     if (res1.error) {
-      await supabase.from('user_samples').delete().eq('id', req.params.listingId).eq('user_id', req.params.uuid);
+      const res2 = await supabase.from('user_samples').delete().eq('id', req.params.listingId).eq('user_id', req.params.uuid);
+      if (res2.error && isMissingTableErr(res2.error)) {
+        const storeRec = await loadStoreRecords(req.params.uuid);
+        storeRec.products = storeRec.products.filter((p) => p.id !== req.params.listingId);
+        await saveStoreRecords(req.params.uuid, storeRec);
+      }
     }
     res.json({ success: true });
   }),
