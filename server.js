@@ -73,7 +73,7 @@ for (const b of [STORAGE_BUCKET, SITE_IMAGES_BUCKET, 'products', 'portfolios', '
 }
 
 const UPLOAD_TYPES = { 'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/heic': 'heic', 'video/mp4': 'mp4', 'video/quicktime': 'mov', 'video/webm': 'webm', 'video/3gpp': '3gp' };
-const UPLOAD_KINDS = ['profile', 'banner', 'sample', 'tools', 'team', 'partner_sample', 'architect_post', 'supplier_product'];
+const UPLOAD_KINDS = ['profile', 'banner', 'sample', 'tools', 'team', 'partner_sample', 'architect_post', 'supplier_product', 'product'];
 
 const ACCESS_TTL = JWT_ACCESS_EXPIRES_IN;
 const REFRESH_TTL = JWT_REFRESH_EXPIRES_IN;
@@ -1188,7 +1188,7 @@ app.post(
     if (!UPLOAD_KINDS.includes(kind)) throw new HttpError(400, 'Invalid kind');
     if (!ext || !Buffer.isBuffer(req.body) || !req.body.length) throw new HttpError(400, 'Unsupported or empty file');
     const isVideo = ['mp4', 'mov', 'webm', '3gp'].includes(ext);
-    if (isVideo && !['sample', 'partner_sample', 'supplier_product', 'architect_post'].includes(kind)) {
+    if (isVideo && !['sample', 'partner_sample', 'supplier_product', 'architect_post', 'product'].includes(kind)) {
       throw new HttpError(400, 'Videos allowed only for samples and product listings');
     }
     const folderMap = {
@@ -1196,8 +1196,9 @@ app.post(
       banner: 'user_media/banner',
       sample: 'user_media/samples',
       partner_sample: 'partner_samples',
-      architect_post: 'architect_posts',
-      supplier_product: 'supplier_products',
+      architect_post: 'products',
+      supplier_product: 'products',
+      product: 'products',
       tools: 'user_media/tools',
       team: 'user_media/team',
     };
@@ -1207,8 +1208,9 @@ app.post(
       profile: STORAGE_BUCKET, banner: STORAGE_BUCKET, sample: STORAGE_BUCKET,
       tools: STORAGE_BUCKET, team: STORAGE_BUCKET,
       partner_sample: 'partner_samples',
-      architect_post: 'architect_portfolio',
-      supplier_product: 'supplier_products',
+      architect_post: 'products',
+      supplier_product: 'products',
+      product: 'products',
     };
     const path = `${folderMap[kind] || kind}/${req.params.uuid}-${Date.now()}.${ext}`;
     let bucket = bucketMap[kind] || STORAGE_BUCKET;
