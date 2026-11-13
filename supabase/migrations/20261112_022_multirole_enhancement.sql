@@ -85,15 +85,16 @@ CREATE TABLE IF NOT EXISTS admin_credentials (
 
 ALTER TABLE admin_credentials ENABLE ROW LEVEL SECURITY;
 
--- Ensure public & private storage buckets exist
+-- Ensure public & private storage buckets exist with correct visibility
 INSERT INTO storage.buckets (id, name, public)
 VALUES
+  ('media', 'media', TRUE),
   ('products', 'products', TRUE),
   ('portfolios', 'portfolios', TRUE),
   ('partner_samples', 'partner_samples', FALSE),
   ('architect_portfolio', 'architect_portfolio', TRUE),
   ('supplier_products', 'supplier_products', TRUE)
-ON CONFLICT (id) DO NOTHING;
+ON CONFLICT (id) DO UPDATE SET public = EXCLUDED.public;
 
 -- RLS Policies for product_listings
 ALTER TABLE product_listings ENABLE ROW LEVEL SECURITY;

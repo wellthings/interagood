@@ -60,13 +60,19 @@ supabase.storage
 supabase.storage
   .createBucket('partner_samples', { public: false })
   .then(({ error }) => error && !/already exists/i.test(error.message) && console.error('[storage]', 'partner_samples', error.message));
-for (const b of ['products', 'portfolios', 'architect_portfolio', 'supplier_products']) {
+for (const b of [STORAGE_BUCKET, SITE_IMAGES_BUCKET, 'products', 'portfolios', 'architect_portfolio', 'supplier_products']) {
   supabase.storage
     .createBucket(b, { public: true })
-    .then(({ error }) => error && !/already exists/i.test(error.message) && console.error('[storage]', b, error.message));
+    .then(async ({ error }) => {
+      if (error && /already exists/i.test(error.message)) {
+        await supabase.storage.updateBucket(b, { public: true }).catch(() => {});
+      } else if (error) {
+        console.error('[storage]', b, error.message);
+      }
+    });
 }
 
-const UPLOAD_TYPES = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'video/mp4': 'mp4', 'video/quicktime': 'mov' };
+const UPLOAD_TYPES = { 'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/heic': 'heic', 'video/mp4': 'mp4', 'video/quicktime': 'mov', 'video/webm': 'webm', 'video/3gpp': '3gp' };
 const UPLOAD_KINDS = ['profile', 'banner', 'sample', 'tools', 'team', 'partner_sample', 'architect_post', 'supplier_product'];
 
 const ACCESS_TTL = JWT_ACCESS_EXPIRES_IN;
@@ -93,6 +99,25 @@ app.use('/api', rateLimit({ windowMs: 60_000, limit: 300, standardHeaders: true,
 const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 30, standardHeaders: true, legacyHeaders: false });
 
 // ---------- helpers ----------
+const isMissingSchemaErr = (err) => {
+  if (!err) return false;
+  const msg = String(err.message || "") + " " + String(err.details || "");
+  return err.code === "42703" || err.code === "42P01" || err.code === "PGRST204" || err.code === "PGRST205" || /does not exist|schema cache|could not find/i.test(msg);
+};
+const isProductFallbackCaption = (cap) => typeof cap === "string" && cap.startsWith("{\"__kind\":\"product\"");
+const resolveSampleUrls = async (samples) => {
+  if (!Array.isArray(samples) || !samples.length) return samples;
+  return Promise.all(samples.map(async (item) => {
+    if (!item || !item.media_url) return item;
+    const m = String(item.media_url).match(/\/storage\/v1\/object\/(?:sign|public)\/partner_samples\/([^?]+)/);
+    if (m && m[1]) {
+      const storagePath = decodeURIComponent(m[1]);
+      const { data } = await supabase.storage.from("partner_samples").createSignedUrl(storagePath, 60 * 60 * 24 * 7);
+      if (data?.signedUrl) return { ...item, media_url: data.signedUrl };
+    }
+    return item;
+  }));
+};
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 class HttpError extends Error {
@@ -1066,16 +1091,14 @@ app.get(
   auth,
   wrap(async (req, res) => {
     const user = await getUser(req.params.uuid);
-    const samples = await withVotes(
-      db(
-        await supabase
-          .from('user_samples')
-          .select(SAMPLE_COLUMNS)
-          .eq('user_id', user.id)
-          .order('created_at', { ascending: false }),
-      ),
-      user.id,
-    );
+    const rawSamples = db(
+      await supabase
+        .from('user_samples')
+        .select(SAMPLE_COLUMNS)
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: false }),
+    ).filter((row) => !isProductFallbackCaption(row.caption));
+    const samples = await resolveSampleUrls(await withVotes(rawSamples, user.id));
     res.json({ success: true, data: { ...sanitizeUser(user), samples } });
   }),
 );
@@ -1119,22 +1142,26 @@ app.post(
   auth,
   wrap(async (req, res) => {
     const kind = String(req.query.kind || '');
-    const ext = UPLOAD_TYPES[req.headers['content-type']?.split(';')[0]];
+    const contentType = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+    const ext = UPLOAD_TYPES[contentType];
     if (!UPLOAD_KINDS.includes(kind)) throw new HttpError(400, 'Invalid kind');
     if (!ext || !Buffer.isBuffer(req.body) || !req.body.length) throw new HttpError(400, 'Unsupported or empty file');
-    if ((ext === 'mp4' || ext === 'mov') && kind !== 'sample' && kind !== 'supplier_product') {
-      throw new HttpError(400, 'Videos allowed only for samples and supplier listings');
+    const isVideo = ['mp4', 'mov', 'webm', '3gp'].includes(ext);
+    if (isVideo && !['sample', 'partner_sample', 'supplier_product', 'architect_post'].includes(kind)) {
+      throw new HttpError(400, 'Videos allowed only for samples and product listings');
     }
     const folderMap = {
       profile: 'user_media/profilephoto',
       banner: 'user_media/banner',
       sample: 'user_media/samples',
+      partner_sample: 'partner_samples',
+      architect_post: 'architect_posts',
+      supplier_product: 'supplier_products',
       tools: 'user_media/tools',
       team: 'user_media/team',
     };
     const liveBilling = isPayuConfigured() || (!!RAZORPAY_KEY_ID && !!RAZORPAY_KEY_SECRET);
-    if (liveBilling && kind === 'sample') await assertActive(req.params.uuid);
-    const contentType = req.headers['content-type'].split(';')[0];
+    if (liveBilling && (kind === 'sample' || kind === 'partner_sample')) await assertActive(req.params.uuid);
     const bucketMap = {
       profile: STORAGE_BUCKET, banner: STORAGE_BUCKET, sample: STORAGE_BUCKET,
       tools: STORAGE_BUCKET, team: STORAGE_BUCKET,
@@ -1143,31 +1170,41 @@ app.post(
       supplier_product: 'supplier_products',
     };
     const path = `${folderMap[kind] || kind}/${req.params.uuid}-${Date.now()}.${ext}`;
-    const bucket = bucketMap[kind] || STORAGE_BUCKET;
+    let bucket = bucketMap[kind] || STORAGE_BUCKET;
     const isPrivate = kind === 'partner_sample';
-    const { error } = await supabase.storage.from(bucket).upload(path, req.body, { contentType });
-    if (error) {
-      console.error('[storage]', error.message);
-      throw new HttpError(500, 'Upload failed');
+
+    let upRes = await supabase.storage.from(bucket).upload(path, req.body, { contentType });
+    if (upRes.error) {
+      await supabase.storage.createBucket(bucket, { public: !isPrivate }).catch(() => {});
+      if (!isPrivate) await supabase.storage.updateBucket(bucket, { public: true }).catch(() => {});
+      upRes = await supabase.storage.from(bucket).upload(path, req.body, { contentType });
     }
-    if (isPrivate) {
-      // Private buckets: generate a signed URL valid for 1 hour for the uploader to preview
-      const { data, error: signErr } = await supabase.storage.from(bucket).createSignedUrl(path, 3600);
+    if (upRes.error && bucket !== STORAGE_BUCKET) {
+      bucket = STORAGE_BUCKET;
+      upRes = await supabase.storage.from(bucket).upload(path, req.body, { contentType });
+    }
+    if (upRes.error) {
+      console.error('[storage]', bucket, upRes.error.message);
+      throw new HttpError(500, 'Upload failed: ' + upRes.error.message);
+    }
+    if (isPrivate && bucket === 'partner_samples') {
+      const { data, error: signErr } = await supabase.storage.from(bucket).createSignedUrl(path, 60 * 60 * 24 * 7);
       res.status(201).json({ success: true, url: signErr ? publicUrl(path, bucket) : data.signedUrl });
       return;
     }
-    res.status(201).json({ success: true, url: publicUrl(path) });
+    res.status(201).json({ success: true, url: publicUrl(path, bucket) });
   }),
 );
 
 // ---------- samples (daily quota: 6 total, 3 images, 3 videos) ----------
 const SAMPLE_COLUMNS = 'id, media_type, title, caption, media_url, thumbnail_url, price, price_unit, created_at';
-const PRICE_UNITS = ['inch', 'sqfit', 'runningfit', 'pcs', 'bundle', 'combo', 'fit'];
+const PRICE_UNITS = ['inch', 'sqfit', 'sqft', 'runningfit', 'rft', 'pcs', 'pieces', 'bundle', 'bundles', 'combo', 'fit', 'feet', 'meter', 'kg', 'liter', 'liters', 'contract'];
 
 // Adds likes / dislikes counts and the viewer's own vote (1, -1 or 0) to each sample
 const withVotes = async (samples, viewerId) => {
   if (!samples.length) return samples;
-  const votes = db(await supabase.from('sample_votes').select('sample_id, user_id, vote').in('sample_id', samples.map((s) => s.id)));
+  const votesRes = await supabase.from('sample_votes').select('sample_id, user_id, vote').in('sample_id', samples.map((s) => s.id));
+  const votes = (!votesRes.error && votesRes.data) ? votesRes.data : [];
   return samples.map((s) => {
     const own = votes.filter((v) => v.sample_id === s.id);
     return {
@@ -1182,50 +1219,100 @@ const withVotes = async (samples, viewerId) => {
 const sampleSchema = z.object({
   media_type: z.enum(['image', 'video']),
   title: z.string().trim().min(1).max(120),
-  caption: z.string().trim().max(300).optional(),
+  caption: z.string().trim().max(300).optional().nullable(),
   media_url: z.string().url(),
   thumbnail_url: z.string().url().nullish(),
-  price: z.coerce.number().positive().max(100_000_000),
-  price_unit: z.enum(PRICE_UNITS),
+  price: z.coerce.number().min(0).max(100_000_000).default(1),
+  price_unit: z.string().trim().max(30).default('pcs'),
+  is_private: z.boolean().optional(),
+  role: z.string().trim().max(20).optional(),
+  phone: z.string().trim().max(20).optional().nullable(),
+  username: z.string().trim().max(60).optional().nullable(),
+  business_name: z.string().trim().max(150).optional().nullable(),
 });
+
+app.get(
+  '/api/users/:uuid/samples',
+  auth,
+  wrap(async (req, res) => {
+    const quota = await getQuotaForUser(req.params.uuid);
+    const raw = db(
+      await supabase
+        .from('user_samples')
+        .select(SAMPLE_COLUMNS)
+        .eq('user_id', req.params.uuid)
+        .order('created_at', { ascending: false }),
+    ).filter((row) => !isProductFallbackCaption(row.caption));
+    const samples = await resolveSampleUrls(await withVotes(raw, req.params.uuid));
+    res.json({ success: true, data: samples, quota });
+  }),
+);
 
 app.post(
   '/api/users/:uuid/samples',
   auth,
   requireActive,
   wrap(async (req, res) => {
+    const user = await getUser(req.params.uuid);
     const body = parse(sampleSchema, req.body);
-    const today = db(
+    const todayRaw = db(
       await supabase
         .from('user_samples')
-        .select('media_type')
+        .select('media_type, caption')
         .eq('user_id', req.params.uuid)
         .gte('created_at', startOfTodayIST()),
     );
+    const today = todayRaw.filter((s) => !isProductFallbackCaption(s.caption));
     if (today.length >= DAILY_LIMITS.total) {
-      throw new HttpError(429, `Daily limit of ${DAILY_LIMITS.total} uploads reached for today.`);
+      throw new HttpError(429, `Daily limit of ${DAILY_LIMITS.total} samples reached for today.`);
     }
     const sameType = today.filter((s) => s.media_type === body.media_type).length;
     if (sameType >= DAILY_LIMITS[body.media_type]) {
       throw new HttpError(429, `Daily maximum of ${DAILY_LIMITS[body.media_type]} ${body.media_type}s reached.`);
     }
-    const sample = db(
-      await supabase
-        .from('user_samples')
-        .insert({
-          user_id: req.params.uuid,
-          media_type: body.media_type,
-          title: body.title,
-          caption: body.caption || null,
-          media_url: body.media_url,
-          thumbnail_url: body.thumbnail_url ?? null,
-          price: body.price,
-          price_unit: body.price_unit,
-        })
-        .select(SAMPLE_COLUMNS)
-        .single(),
-    );
-    res.status(201).json({ success: true, data: { ...sample, likes: 0, dislikes: 0, my_vote: 0 } });
+    const safePrice = body.price > 0 ? body.price : 1;
+    const safeUnit = UNIT_TO_SAMPLE_UNIT[String(body.price_unit || 'pcs').toLowerCase()] || 'pcs';
+    const baseRow = {
+      user_id: req.params.uuid,
+      media_type: body.media_type,
+      title: body.title,
+      caption: body.caption || null,
+      media_url: body.media_url,
+      thumbnail_url: body.thumbnail_url ?? null,
+      price: safePrice,
+      price_unit: safeUnit,
+    };
+    const extendedRow = {
+      ...baseRow,
+      is_private: body.is_private ?? (user.role === 'partner'),
+      role: body.role || user.role,
+      phone: body.phone || user.phone || null,
+      username: body.username || user.username || null,
+      business_name: body.business_name || user.business_name || null,
+    };
+
+    let insRes = await supabase.from('user_samples').insert(extendedRow).select(SAMPLE_COLUMNS).single();
+    if (insRes.error && isMissingSchemaErr(insRes.error)) {
+      insRes = await supabase.from('user_samples').insert(baseRow).select(SAMPLE_COLUMNS).single();
+    }
+    const sample = db(insRes);
+    const [resolved] = await resolveSampleUrls([sample]);
+    const quota = await getQuotaForUser(user.id);
+    res.status(201).json({
+      success: true,
+      data: {
+        ...resolved,
+        role: extendedRow.role,
+        phone: extendedRow.phone,
+        username: extendedRow.username,
+        business_name: extendedRow.business_name,
+        is_private: extendedRow.is_private,
+        likes: 0,
+        dislikes: 0,
+        my_vote: 0,
+      },
+      quota,
+    });
   }),
 );
 
@@ -1255,9 +1342,8 @@ app.delete(
     const deleted = db(
       await supabase.from('user_samples').delete().eq('id', req.params.sampleId).eq('user_id', req.params.uuid).select('media_url'),
     );
-    // Best effort: remove the uploaded file too (public URL -> storage path)
     const marker = `/object/public/${STORAGE_BUCKET}/`;
-    const paths = deleted.map((s) => s.media_url.split(marker)[1]).filter(Boolean).map(decodeURIComponent);
+    const paths = deleted.map((s) => String(s.media_url || '').split(marker)[1]).filter(Boolean).map(decodeURIComponent);
     if (paths.length) {
       const { error } = await supabase.storage.from(STORAGE_BUCKET).remove(paths);
       if (error) console.error('[storage] sample cleanup', error.message);
@@ -1266,7 +1352,7 @@ app.delete(
   }),
 );
 
-// ---------- multi-role listings (Supplier products + Architect posts + Partner private evaluation samples) ----------
+// ---------- multi-role product listings (4/day limit; with_material locked true ONLY for architect) ----------
 const maskPhone = (phone) => {
   const d = String(phone || '').replace(/\D/g, '');
   if (d.length < 10) return '+91 98XXX-XX000';
@@ -1279,11 +1365,10 @@ const UNIT_TO_SAMPLE_UNIT = {
   rft: 'runningfit', runningfit: 'runningfit',
   feet: 'fit', fit: 'fit',
   inches: 'inch', inch: 'inch',
-  meter: 'fit',
+  meter: 'fit', kg: 'pcs', liter: 'pcs', liters: 'pcs',
   pieces: 'pcs', pcs: 'pcs',
-  liters: 'bundle',
   bundles: 'bundle', bundle: 'bundle',
-  combo: 'combo',
+  combo: 'combo', contract: 'combo',
 };
 
 const listingSchema = z.object({
@@ -1291,11 +1376,11 @@ const listingSchema = z.object({
   category: z.string().trim().min(1).max(100).default('General'),
   sub_category: z.string().trim().max(100).optional().nullable(),
   description: z.string().trim().max(1000).optional().nullable(),
-  unit: z.string().trim().max(30).default('sqft'),
+  unit: z.string().trim().max(30).default('sqfit'),
   rate_per_unit: z.coerce.number().min(0).max(100_000_000).default(0),
   quantity: z.coerce.number().min(0.01).max(1_000_000).default(1),
   expected_amount: z.coerce.number().min(0).max(100_000_000).optional().nullable(),
-  with_material: z.boolean().optional().default(true),
+  with_material: z.boolean().optional().default(false),
   image_url: z.string().url().optional().nullable(),
   media_type: z.enum(['image', 'video']).default('image'),
   is_private: z.boolean().optional().default(false),
@@ -1303,10 +1388,12 @@ const listingSchema = z.object({
 
 const getQuotaForUser = async (userId) => {
   const since = startOfTodayIST();
-  const sampleRes = await supabase.from('user_samples').select('media_type').eq('user_id', userId).gte('created_at', since);
-  const sampleRows = (!sampleRes.error && sampleRes.data) ? sampleRes.data : [];
+  const sampleRes = await supabase.from('user_samples').select('media_type, caption').eq('user_id', userId).gte('created_at', since);
+  const allSampleRows = (!sampleRes.error && sampleRes.data) ? sampleRes.data : [];
+  const sampleRows = allSampleRows.filter((r) => !isProductFallbackCaption(r.caption));
+  const fallbackProdRows = allSampleRows.filter((r) => isProductFallbackCaption(r.caption));
   const prodRes = await supabase.from('product_listings').select('id').eq('user_id', userId).gte('created_at', since);
-  const prodRows = (!prodRes.error && prodRes.data) ? prodRes.data : [];
+  const prodCount = (!prodRes.error && prodRes.data) ? prodRes.data.length : fallbackProdRows.length;
   const imagesUsed = sampleRows.filter((r) => r.media_type === 'image').length;
   const videosUsed = sampleRows.filter((r) => r.media_type === 'video').length;
   return {
@@ -1325,7 +1412,7 @@ const getQuotaForUser = async (userId) => {
       maxVideos: DAILY_LIMITS.video,
     },
     products: {
-      totalUsed: prodRows.length,
+      totalUsed: prodCount,
       maxTotal: PRODUCT_DAILY_LIMIT,
     },
   };
@@ -1346,27 +1433,30 @@ app.get(
     const fallback = db(
       await supabase.from('user_samples').select(SAMPLE_COLUMNS).eq('user_id', req.params.uuid).order('created_at', { ascending: false }),
     );
-    const mapped = fallback.map((s) => {
-      let meta = {};
-      try { if (s.caption && s.caption.startsWith('{')) meta = JSON.parse(s.caption); } catch {}
-      return {
-        id: s.id,
-        user_id: req.params.uuid,
-        title: s.title,
-        category: meta.category || 'General',
-        sub_category: meta.sub_category || null,
-        description: meta.description || s.caption || '',
-        unit: meta.unit || s.price_unit || 'sqft',
-        rate_per_unit: Number(s.price) || 0,
-        quantity: Number(meta.quantity) || 1,
-        total_amount: Number(meta.total_amount) || Number(s.price) || 0,
-        with_material: meta.with_material !== false,
-        image_url: s.media_url,
-        media_type: s.media_type || 'image',
-        is_private: !!meta.is_private,
-        created_at: s.created_at,
-      };
-    });
+    const mapped = fallback
+      .filter((s) => isProductFallbackCaption(s.caption))
+      .map((s) => {
+        let meta = {};
+        try { meta = JSON.parse(s.caption); } catch {}
+        return {
+          id: s.id,
+          user_id: req.params.uuid,
+          title: s.title,
+          category: meta.category || 'General',
+          sub_category: meta.sub_category || null,
+          description: meta.description || '',
+          unit: meta.unit || s.price_unit || 'sqfit',
+          rate_per_unit: Number(s.price) || 0,
+          quantity: Number(meta.quantity) || 1,
+          expected_amount: Number(meta.expected_amount) || Number(meta.total_amount) || Number(s.price) || 0,
+          total_amount: Number(meta.total_amount) || Number(s.price) || 0,
+          with_material: meta.with_material === true,
+          image_url: s.media_url,
+          media_type: s.media_type || 'image',
+          is_private: !!meta.is_private,
+          created_at: s.created_at,
+        };
+      });
     res.json({ success: true, data: mapped, quota });
   }),
 );
@@ -1378,56 +1468,57 @@ app.post(
     const user = await getUser(req.params.uuid);
     const b = parse(listingSchema, req.body);
     const quota = await getQuotaForUser(user.id);
-    if (user.role === 'supplier') {
-      if (quota.totalUsed >= DAILY_LIMITS.total) {
-        throw new HttpError(429, `Daily upload limit reached: maximum ${DAILY_LIMITS.total} uploads (2 images, 2 videos) per day.`);
-      }
-      if (b.media_type === 'image' && quota.imagesUsed >= DAILY_LIMITS.image) {
-        throw new HttpError(429, `Daily image upload limit reached: max ${DAILY_LIMITS.image} images per day.`);
-      }
-      if (b.media_type === 'video' && quota.videosUsed >= DAILY_LIMITS.video) {
-        throw new HttpError(429, `Daily video upload limit reached: max ${DAILY_LIMITS.video} videos per day.`);
-      }
+    if (quota.products.totalUsed >= PRODUCT_DAILY_LIMIT) {
+      throw new HttpError(429, `Daily product listing limit reached: maximum ${PRODUCT_DAILY_LIMIT} products per day.`);
     }
     const subtotal = Math.round(b.rate_per_unit * b.quantity * 100) / 100;
-    const isPrivate = user.role === 'partner' ? true : !!b.is_private;
-    const withMaterial = user.role === 'architect' ? true : b.with_material !== false;
+    const expectedAmt = b.expected_amount != null ? Number(b.expected_amount) : subtotal;
+    const isPrivate = !!b.is_private;
+    // with_material stays locked TRUE exclusively for Architect; FALSE for Partner & Supplier
+    const withMaterial = user.role === 'architect';
 
-    const { data, error } = await supabase
+    const baseListing = {
+      user_id: user.id,
+      role: user.role,
+      title: b.title,
+      category: b.category,
+      sub_category: b.sub_category || null,
+      description: b.description || null,
+      unit: b.unit,
+      rate_per_unit: b.rate_per_unit,
+      quantity: b.quantity,
+      total_amount: expectedAmt || subtotal,
+      with_material: withMaterial,
+      image_url: b.image_url || null,
+      media_type: b.media_type,
+      is_private: isPrivate,
+    };
+
+    let insRes = await supabase
       .from('product_listings')
-      .insert({
-        user_id: user.id,
-        role: user.role,
-        title: b.title,
-        category: b.category,
-        sub_category: b.sub_category || null,
-        description: b.description || null,
-        unit: b.unit,
-        rate_per_unit: b.rate_per_unit,
-        quantity: b.quantity,
-        total_amount: subtotal,
-        with_material: withMaterial,
-        image_url: b.image_url || null,
-        media_type: b.media_type,
-        is_private: isPrivate,
-      })
+      .insert({ ...baseListing, expected_amount: expectedAmt })
       .select('*')
       .single();
-
-    if (!error) {
-      return res.status(201).json({ success: true, data, quota: await getQuotaForUser(user.id) });
+    if (insRes.error && isMissingSchemaErr(insRes.error)) {
+      insRes = await supabase.from('product_listings').insert(baseListing).select('*').single();
     }
 
-    // Fallback to user_samples if product_listings migration has not been applied yet
+    if (!insRes.error) {
+      return res.status(201).json({ success: true, data: insRes.data, quota: await getQuotaForUser(user.id) });
+    }
+
+    // Fallback to user_samples ONLY if product_listings table does not exist yet
     const sampleUnit = UNIT_TO_SAMPLE_UNIT[b.unit.toLowerCase()] || 'sqfit';
     const safePrice = b.rate_per_unit > 0 ? b.rate_per_unit : 1;
     const metaCaption = JSON.stringify({
+      __kind: 'product',
       category: b.category,
       sub_category: b.sub_category || null,
-      description: b.description || '',
+      description: (b.description || '').slice(0, 120),
       unit: b.unit,
       quantity: b.quantity,
-      total_amount: subtotal,
+      expected_amount: expectedAmt,
+      total_amount: expectedAmt || subtotal,
       with_material: withMaterial,
       is_private: isPrivate,
     }).slice(0, 295);
@@ -1460,7 +1551,8 @@ app.post(
         unit: b.unit,
         rate_per_unit: b.rate_per_unit,
         quantity: b.quantity,
-        total_amount: subtotal,
+        expected_amount: expectedAmt,
+        total_amount: expectedAmt || subtotal,
         with_material: withMaterial,
         image_url: fb.media_url,
         media_type: fb.media_type,
@@ -1484,7 +1576,6 @@ app.delete(
     res.json({ success: true });
   }),
 );
-
 
 // ---------- business cards (what a client sees in the list) ----------
 // Card JSON never contains the phone number or coordinates. They are used only on the server to build the
@@ -1685,13 +1776,19 @@ app.get(
   publicLimiter,
   wrap(async (req, res) => {
     const roleFilter = req.query.role ? String(req.query.role) : null;
-    const profiles = db(
-      await supabase
+    let profRes = await supabase
+      .from('profiles')
+      .select('user_id, business_name, profile_photo_url, banner_url, category_name, skill_level, is_online, payment_status, city, users!inner(role, username, phone)')
+      .not('business_name', 'is', null)
+      .limit(200);
+    if (profRes.error && isMissingSchemaErr(profRes.error)) {
+      profRes = await supabase
         .from('profiles')
-        .select('user_id, business_name, profile_photo_url, banner_url, category_name, skill_level, is_online, payment_status, city, users!inner(role, username, phone)')
+        .select('user_id, business_name, profile_photo_url, banner_url, category_name, is_online, payment_status, city, users!inner(role, username, phone)')
         .not('business_name', 'is', null)
-        .limit(200),
-    );
+        .limit(200);
+    }
+    const profiles = db(profRes);
     const byUser = new Map();
     profiles.forEach((p) => {
       const u = p.users || {};
@@ -1724,7 +1821,7 @@ app.get(
     if (!res1.error && res1.data) {
       listings = res1.data;
     } else {
-      const fb = db(await supabase.from('user_samples').select('id, user_id, media_type, title, caption, media_url, price, price_unit, created_at').order('created_at', { ascending: false }).limit(120));
+      const fb = db(await supabase.from('user_samples').select('id, user_id, media_type, title, caption, media_url, price, price_unit, created_at').order('created_at', { ascending: false }).limit(120)).filter((r) => isProductFallbackCaption(r.caption));
       listings = fb.map((s) => {
         let meta = {};
         try { if (s.caption && s.caption.startsWith('{')) meta = JSON.parse(s.caption); } catch {}
