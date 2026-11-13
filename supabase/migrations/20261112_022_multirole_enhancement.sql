@@ -1,9 +1,9 @@
 -- 20261112_022_multirole_enhancement.sql
 -- Interagood Platform Multi-Role Enhancement:
--- Enhanced profiles, dynamic posts/products table, and admin verification
+-- Enhanced profiles, dynamic posts/products table, private partner samples, and admin credentials linking
 
 ALTER TABLE profiles
-  ADD COLUMN IF NOT EXISTS skill_level VARCHAR(30) DEFAULT 'Intermediate',
+  ADD COLUMN IF NOT EXISTS skill_level TEXT DEFAULT 'intermediate',
   ADD COLUMN IF NOT EXISTS courses_completed TEXT,
   ADD COLUMN IF NOT EXISTS design_software TEXT,
   ADD COLUMN IF NOT EXISTS shop_history_years INT DEFAULT 0,
@@ -11,10 +11,29 @@ ALTER TABLE profiles
   ADD COLUMN IF NOT EXISTS daily_videos_uploaded INT DEFAULT 0,
   ADD COLUMN IF NOT EXISTS last_sample_upload_date DATE DEFAULT CURRENT_DATE,
   ADD COLUMN IF NOT EXISTS next_billing_date TIMESTAMPTZ DEFAULT (NOW() + interval '30 days'),
-  ADD COLUMN IF NOT EXISTS payment_timing VARCHAR(50) DEFAULT 'Monthly Recurring',
+  ADD COLUMN IF NOT EXISTS payment_timing VARCHAR(50) DEFAULT 'Monthly Cycle',
   ADD COLUMN IF NOT EXISTS is_online BOOLEAN DEFAULT TRUE;
 
--- Product & Post Listings table for Suppliers (independent hardware/materials) & Architects (designs/structures)
+-- Ensure skill_level uses consistent lowercase enum values
+UPDATE profiles SET skill_level = lower(skill_level) WHERE skill_level IS NOT NULL;
+ALTER TABLE profiles ALTER COLUMN skill_level SET DEFAULT 'intermediate';
+
+-- Compatibility view alias if any query checks partner_category singular
+DO $$
+BEGIN
+  IF to_regclass('public.partner_categories') IS NOT NULL AND to_regclass('public.partner_category') IS NULL THEN
+    CREATE VIEW partner_category AS SELECT * FROM partner_categories;
+  END IF;
+END $$;
+
+-- Track private flag on existing user_samples for partner skill evaluation
+ALTER TABLE user_samples
+  ADD COLUMN IF NOT EXISTS is_private BOOLEAN NOT NULL DEFAULT FALSE,
+  ADD COLUMN IF NOT EXISTS category VARCHAR(100),
+  ADD COLUMN IF NOT EXISTS sub_category VARCHAR(100),
+  ADD COLUMN IF NOT EXISTS with_material BOOLEAN NOT NULL DEFAULT TRUE;
+
+-- Product & Post Listings table for Suppliers (independent hardware/materials), Architects (designs/structures) & Partners (private samples)
 CREATE TABLE IF NOT EXISTS product_listings (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -36,30 +55,57 @@ CREATE TABLE IF NOT EXISTS product_listings (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+CREATE INDEX IF NOT EXISTS idx_product_listings_public ON product_listings (role, is_active, is_private, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_product_listings_user ON product_listings (user_id, created_at DESC);
+
+-- Link admin_panel securely with primary users table
+ALTER TABLE admin_panel
+  ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id) ON DELETE SET NULL;
+
 -- Admin credentials table linking securely to users
 CREATE TABLE IF NOT EXISTS admin_credentials (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID REFERENCES users(id) ON DELETE CASCADE,
   username VARCHAR(60) NOT NULL UNIQUE,
   phone VARCHAR(20) NOT NULL UNIQUE,
+  password_hash TEXT,
   secret_key_hash TEXT NOT NULL,
   role VARCHAR(30) DEFAULT 'super_admin',
   is_active BOOLEAN DEFAULT TRUE,
+  last_login_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Ensure public storage bucket exists for products and architect portfolios
+ALTER TABLE admin_credentials ENABLE ROW LEVEL SECURITY;
+
+-- Ensure public & private storage buckets exist
 INSERT INTO storage.buckets (id, name, public)
-VALUES ('products', 'products', TRUE), ('portfolios', 'portfolios', TRUE)
+VALUES
+  ('products', 'products', TRUE),
+  ('portfolios', 'portfolios', TRUE),
+  ('partner_samples', 'partner_samples', FALSE),
+  ('architect_portfolio', 'architect_portfolio', TRUE),
+  ('supplier_products', 'supplier_products', TRUE)
 ON CONFLICT (id) DO NOTHING;
 
--- RLS Policies
+-- RLS Policies for product_listings
 ALTER TABLE product_listings ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY "Public can view active public product listings"
-  ON product_listings FOR SELECT
-  USING (is_active = TRUE AND is_private = FALSE);
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies WHERE tablename = 'product_listings' AND policyname = 'Public can view active public product listings'
+  ) THEN
+    CREATE POLICY "Public can view active public product listings"
+      ON product_listings FOR SELECT
+      USING (is_active = TRUE AND is_private = FALSE);
+  END IF;
 
-CREATE POLICY "Users can manage their own listings"
-  ON product_listings FOR ALL
-  USING (auth.uid() = user_id);
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies WHERE tablename = 'product_listings' AND policyname = 'Users can manage their own listings'
+  ) THEN
+    CREATE POLICY "Users can manage their own listings"
+      ON product_listings FOR ALL
+      USING (auth.uid() = user_id);
+  END IF;
+END $$;
