@@ -1787,7 +1787,7 @@ const listableCards = () =>
     .from('profiles')
     .select(CARD_COLUMNS)
     .eq('onboarding.payment_status', 'paid')
-    .or(`onboarding.next_due_at.is.null,onboarding.next_due_at.gt.${new Date().toISOString()}`, { foreignTable: 'onboarding' })
+    .or(`next_due_at.is.null,next_due_at.gt.${new Date().toISOString()}`, { foreignTable: 'onboarding' })
     .not('business_name', 'is', null);
 
 const cardListQuery = z.object({
