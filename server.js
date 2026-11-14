@@ -590,6 +590,14 @@ app.get('/api/categories/partner', categoryRoute('partner_categories'));
 app.get('/api/categories/supplier', categoryRoute('supplier_categories'));
 app.get('/api/partner_category', categoryRoute('partner_categories'));
 
+app.get(
+  '/api/measurement-units',
+  wrap(async (_req, res) => {
+    const rows = db(await supabase.from('measurement_units').select('id, code, name').order('id'));
+    res.json({ success: true, data: rows });
+  }),
+);
+
 // Public site images from Supabase storage bucket "site_images" for the homepage gallery
 async function listImagesRecursive(bucket, prefix = '', depth = 0) {
   if (depth > 4) return [];
