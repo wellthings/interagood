@@ -219,21 +219,39 @@ const sanitizeUser = ({ password_hash, latitude, longitude, ...rest }) => rest;
 // getUser/updateUser present both as one object so the rest of the API stays unchanged.
 const IDENTITY_COLUMNS = ['role', 'phone', 'username', 'password_hash'];
 
+const ONBOARDING_COLUMNS = ['ig_id', 'skill_level', 'payment_status', 'payment_due_date', 'last_paid_at', 'next_due_at', 'leads_status', 'terms_accepted'];
+const DASHBOARD_COLUMNS = ['is_online', 'daily_upload_count', 'daily_upload_reset_at'];
+
 const getUser = async (id) => {
   const user = db(await supabase.from('users').select('*').eq('id', id).maybeSingle());
   if (!user) throw new HttpError(404, 'User not found');
-  const { user_id, ...profile } = db(await supabase.from('profiles').select('*').eq('user_id', id).maybeSingle()) || {};
-  return { ...profile, ...user };
+  const profile = db(await supabase.from('profiles').select('*').eq('user_id', id).maybeSingle()) || {};
+  const onboarding = db(await supabase.from('onboarding').select('*').eq('user_id', id).maybeSingle()) || {};
+  const dashboard = db(await supabase.from('dashboard').select('*').eq('user_id', id).maybeSingle()) || {};
+  const { user_id: _p, ...profileRest } = profile;
+  const { user_id: _o, ...onboardingRest } = onboarding;
+  const { user_id: _d, ...dashboardRest } = dashboard;
+  return { ...profileRest, ...onboardingRest, ...dashboardRest, ...user };
 };
 
 const updateUser = async (id, updates) => {
   const now = new Date().toISOString();
   const identity = Object.fromEntries(Object.entries(updates).filter(([k]) => IDENTITY_COLUMNS.includes(k)));
-  const profile = Object.fromEntries(Object.entries(updates).filter(([k]) => !IDENTITY_COLUMNS.includes(k)));
+  const onboarding = Object.fromEntries(Object.entries(updates).filter(([k]) => ONBOARDING_COLUMNS.includes(k)));
+  const dashboard = Object.fromEntries(Object.entries(updates).filter(([k]) => DASHBOARD_COLUMNS.includes(k)));
+  const profile = Object.fromEntries(
+    Object.entries(updates).filter(([k]) => !IDENTITY_COLUMNS.includes(k) && !ONBOARDING_COLUMNS.includes(k) && !DASHBOARD_COLUMNS.includes(k)),
+  );
   const rows = db(await supabase.from('users').update({ ...identity, updated_at: now }).eq('id', id).select('id'));
   if (!rows.length) throw new HttpError(404, 'User not found');
   if (Object.keys(profile).length) {
     db(await supabase.from('profiles').upsert({ user_id: id, ...profile, updated_at: now }, { onConflict: 'user_id' }));
+  }
+  if (Object.keys(onboarding).length) {
+    db(await supabase.from('onboarding').upsert({ user_id: id, ...onboarding, updated_at: now }, { onConflict: 'user_id' }));
+  }
+  if (Object.keys(dashboard).length) {
+    db(await supabase.from('dashboard').upsert({ user_id: id, ...dashboard, updated_at: now }, { onConflict: 'user_id' }));
   }
 };
 
@@ -492,10 +510,16 @@ app.post(
         .select('id, role')
         .single(),
     );
-    const { error: profileError } = await supabase.from('profiles').insert({ user_id: user.id, terms_accepted: true });
+    const profileInserts = [
+      supabase.from('profiles').insert({ user_id: user.id }),
+      supabase.from('onboarding').insert({ user_id: user.id, terms_accepted: true }),
+      supabase.from('dashboard').insert({ user_id: user.id }),
+    ];
+    const results = await Promise.all(profileInserts);
+    const profileError = results.find((r) => r && r.error);
     if (profileError) {
       await supabase.from('users').delete().eq('id', user.id);
-      console.error('[supabase]', profileError);
+      console.error('[supabase]', profileError.error);
       throw new HttpError(500, 'Database error');
     }
     res.status(201).json({ success: true, uuid: user.id, role: user.role, ...signTokens(user) });
@@ -780,20 +804,11 @@ const businessSchema = z.object({
   banner_url: optUrl,
   age: z.coerce.number().int().min(20).max(65).nullish(),
   experience_years: z.coerce.number().int().min(4).max(20).nullish(),
-  has_tools: optBool,
   has_team: optBool,
   team_members_count: z.coerce.number().int().min(0).nullish(),
-  knows_work_completely: optBool,
-  knows_measurement_system: optBool,
-  can_deal_with_customers: optBool,
-  can_manage_quotation_workflow: optBool,
-  knows_pricing: optBool,
 });
 
-const PARTNER_ONLY_FIELDS = [
-  'age', 'experience_years', 'has_tools', 'has_team', 'team_members_count', 'knows_work_completely',
-  'knows_measurement_system', 'can_deal_with_customers', 'can_manage_quotation_workflow', 'knows_pricing',
-];
+const PARTNER_ONLY_FIELDS = ['age', 'experience_years', 'has_team', 'team_members_count'];
 
 app.patch(
   '/api/users/:uuid/business-profile',
@@ -877,17 +892,15 @@ const setupSchemas = {
     education: z.string().trim().max(150).nullish().or(z.literal('')),
     courses_completed: z.string().trim().max(150).nullish().or(z.literal('')),
     design_software: z.string().trim().max(80).nullish().or(z.literal('')),
-    uses_boq_tools: z.boolean().optional().default(true),
-    worked_with_team_before: z.boolean().optional().default(true),
   }),
 };
 
 const ensureIgId = async (userId) => {
-  const existing = db(await supabase.from('profiles').select('ig_id').eq('user_id', userId).maybeSingle());
+  const existing = db(await supabase.from('onboarding').select('ig_id').eq('user_id', userId).maybeSingle());
   if (existing?.ig_id) return existing.ig_id;
   for (let attempt = 0; attempt < 10; attempt++) {
     const candidate = makeIgId();
-    const taken = db(await supabase.from('profiles').select('user_id').eq('ig_id', candidate).maybeSingle());
+    const taken = db(await supabase.from('onboarding').select('user_id').eq('ig_id', candidate).maybeSingle());
     if (!taken) return candidate;
   }
   throw new HttpError(500, 'Could not generate IG ID, please retry');
@@ -1735,8 +1748,16 @@ app.delete(
 // Card JSON never contains the phone number or coordinates. They are used only on the server to build the
 // call / chat / navigation links, which the client app opens when the matching button is tapped.
 const CARD_COLUMNS =
-  'user_id, business_name, profile_photo_url, banner_url, category_name, is_online, payment_status, next_due_at, latitude, longitude, created_at, users!inner(role, username)';
-const flatCard = ({ user_id, users, created_at, ...rest }) => ({ id: user_id, role: users.role, username: users.username, ...rest });
+  'user_id, business_name, profile_photo_url, banner_url, category_name, latitude, longitude, created_at, onboarding!inner(payment_status, next_due_at), dashboard(is_online), users!inner(role, username)';
+const flatCard = ({ user_id, users, onboarding, dashboard, created_at, ...rest }) => ({
+  id: user_id,
+  role: users.role,
+  username: users.username,
+  ...rest,
+  ...(onboarding || {}),
+  ...(dashboard || {}),
+  created_at,
+});
 const cardContactLimiter = rateLimit({ windowMs: 60 * 60_000, limit: 120, standardHeaders: true, legacyHeaders: false });
 
 const distanceKm = (lat1, lon1, lat2, lon2) => {
@@ -1765,8 +1786,8 @@ const listableCards = () =>
   supabase
     .from('profiles')
     .select(CARD_COLUMNS)
-    .eq('payment_status', 'paid')
-    .or(`next_due_at.is.null,next_due_at.gt.${new Date().toISOString()}`)
+    .eq('onboarding.payment_status', 'paid')
+    .or(`onboarding.next_due_at.is.null,onboarding.next_due_at.gt.${new Date().toISOString()}`, { foreignTable: 'onboarding' })
     .not('business_name', 'is', null);
 
 const cardListQuery = z.object({
@@ -1932,7 +1953,7 @@ app.get(
     const roleFilter = req.query.role ? String(req.query.role) : null;
     const profRes = await supabase
       .from('profiles')
-      .select('*, users!inner(role, username, phone)')
+      .select('*, onboarding(skill_level), dashboard(is_online), users!inner(role, username, phone)')
       .not('business_name', 'is', null)
       .limit(200);
     const profiles = (!profRes.error && profRes.data) ? profRes.data : [];
@@ -1947,9 +1968,9 @@ app.get(
         profile_photo_url: p.profile_photo_url,
         banner_url: p.banner_url,
         category_name: p.category_name,
-        skill_level: p.skill_level || 'intermediate',
+        skill_level: (p.onboarding && p.onboarding.skill_level) || 'intermediate',
         city: p.city || '',
-        is_online: p.is_online !== false,
+        is_online: !(p.dashboard && p.dashboard.is_online === false),
         verified: true,
         masked_phone: maskPhone(u.phone),
       });
@@ -2409,7 +2430,7 @@ app.get(
     await getAdmin(req);
     const onlyOnline = req.query.online === 'true';
     const roleFilter = req.query.role && req.query.role !== 'all' ? String(req.query.role) : null;
-    const profileCols = 'user_id, full_name, business_name, category_name, skill_level, age, experience_years, shop_years, education, design_software, city, state, address, is_online, payment_status, next_due_at, ig_id, has_team, has_tools, knows_work_completely, users!inner(id, role, username, phone, created_at)';
+    const profileCols = 'user_id, full_name, business_name, category_name, age, experience_years, shop_years, education, design_software, city, state, address, has_team, onboarding(ig_id, skill_level, payment_status, next_due_at), dashboard(is_online), users!inner(id, role, username, phone, created_at)';
     let profilesRes = await supabase.from('profiles').select(`${profileCols}, verified`).limit(300);
     if (profilesRes.error && /verified|column|schema|42703|42P01/i.test(String(profilesRes.error.message || ''))) {
       profilesRes = await supabase.from('profiles').select(profileCols).limit(300);
@@ -2450,11 +2471,11 @@ app.get(
           role: u.role,
           username: u.username,
           phone: u.phone,
-          ig_id: p.ig_id,
+          ig_id: p.onboarding ? p.onboarding.ig_id : null,
           full_name: p.full_name,
           business_name: p.business_name,
           category_name: p.category_name,
-          skill_level: p.skill_level || 'intermediate',
+          skill_level: (p.onboarding && p.onboarding.skill_level) || 'intermediate',
           age: p.age,
           experience_years: p.experience_years,
           shop_years: p.shop_years,
@@ -2463,11 +2484,11 @@ app.get(
           city: p.city,
           state: p.state,
           address: p.address,
-          is_online: p.is_online !== false,
-          payment_status: p.payment_status,
+          is_online: !(p.dashboard && p.dashboard.is_online === false),
+          payment_status: p.onboarding ? p.onboarding.payment_status : null,
           has_team: !!p.has_team,
-          has_tools: !!p.has_tools,
-          knows_work_completely: !!p.knows_work_completely,
+          has_tools: false,
+          knows_work_completely: false,
           verified: !!p.verified,
           private_samples: sampleMap.get(p.user_id) || [],
           created_at: u.created_at,
@@ -2588,8 +2609,8 @@ app.get(
     const soon = new Date(now.getTime() + 7 * 86400_000).toISOString();
     const rows = db(
       await supabase
-        .from('profiles')
-        .select('user_id, next_due_at, users!inner(role, phone, full_name, business_name)')
+        .from('onboarding')
+        .select('user_id, next_due_at, users!inner(role, phone)')
         .eq('payment_status', 'paid')
         .lte('next_due_at', soon)
         .gt('next_due_at', now.toISOString()),
