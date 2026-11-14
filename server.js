@@ -899,9 +899,13 @@ app.post(
       data.category_name = cat.name;
     }
     if (role === 'partner') {
-      if (!data.has_team || !data.has_tools || !data.knows_work_completely) {
-        throw new HttpError(400, 'All 3 mandatory confirmations (working team, own tools, complete work & pricing knowledge) are required.');
+      if (!data.has_tools || !data.knows_work_completely) {
+        throw new HttpError(400, 'Tool aur knowledge ki confirmation required hai.');
       }
+      if (data.has_team && !(data.team_members_count > 0)) {
+        throw new HttpError(400, 'Team select kiya hai toh members count zaroori hai.');
+      }
+      if (!data.has_team) data.team_members_count = null;
       if (data.knows_pricing != null) data.knows_measurement_system = data.knows_pricing;
       else data.knows_measurement_system = true;
       data.knows_pricing = true;
