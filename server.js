@@ -2609,18 +2609,18 @@ app.get(
     const soon = new Date(now.getTime() + 7 * 86400_000).toISOString();
     const rows = db(
       await supabase
-        .from('onboarding')
-        .select('user_id, next_due_at, users!inner(role, phone)')
-        .eq('payment_status', 'paid')
-        .lte('next_due_at', soon)
-        .gt('next_due_at', now.toISOString()),
+        .from('profiles')
+        .select('user_id, onboarding!inner(next_due_at, payment_status), users!inner(role, phone)')
+        .eq('onboarding.payment_status', 'paid')
+        .lte('onboarding.next_due_at', soon)
+        .gt('onboarding.next_due_at', now.toISOString()),
     );
     let notified = 0;
     for (const r of rows) {
       const phone = r.users?.phone;
       if (!phone) continue;
       const amount = PLANS[r.users.role] ? PLANS[r.users.role].amountPaise / 100 : '';
-      const date = new Date(r.next_due_at).toLocaleDateString('en-IN');
+      const date = new Date(r.onboarding.next_due_at).toLocaleDateString('en-IN');
       await sendSms(phone, `InteraGood: your ${r.users.role} plan (Rs ${amount}) is due on ${date}. Pay in the app to stay online.`);
       notified += 1;
     }
