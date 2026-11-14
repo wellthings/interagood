@@ -340,7 +340,7 @@ app.get('/api/health', wrap(async (_req, res) => {
     return r.error ? { exists: false, code: r.error.code || null, message: r.error.message } : { exists: true };
   };
   const tables = {};
-  for (const t of ['users', 'profiles', 'user_samples', 'product_listings', 'partner_categories', 'supplier_categories', 'order_assignments']) {
+  for (const t of ['users', 'profiles', 'onboarding', 'dashboard', 'user_samples', 'product_listings', 'partner_categories', 'supplier_categories', 'order_assignments']) {
     tables[t] = await checkTable(t);
   }
   res.json({ status: 'ok', buckets, tables });
