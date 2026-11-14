@@ -530,6 +530,8 @@ app.post(
       payment_status: fullUser?.payment_status || "unpaid",
       is_online: !!fullUser?.is_online,
       profile_completed: !!fullUser?.business_name,
+      verified: fullUser?.verified !== undefined ? !!fullUser.verified : null,
+      restricted_until: fullUser?.restricted_until || null,
       profile: fullUser ? sanitizeUser(fullUser) : null,
       ...signTokens(user),
     });
@@ -913,8 +915,15 @@ app.post(
     let persist = data;
     let verifiedFlag = null;
     if (role === 'partner') {
+      // Block re-apply while the 7-day unverified cooldown is still active.
+      const existing = await supabase.from('profiles').select('restricted_until').eq('user_id', req.params.uuid).maybeSingle();
+      const until = (existing && existing.data && existing.data.restricted_until) ? new Date(existing.data.restricted_until).getTime() : 0;
+      if (until > Date.now()) {
+        throw new HttpError(403, 'Aapke 7 din abhi poore nahi hue hain. 7 din baad hi aap dobara apply kar sakte hain.');
+      }
       const verified = !!data.has_tools && !!data.knows_work_completely;
       verifiedFlag = verified;
+      const restrictedUntil = verified ? null : new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
       // Partners persist a lean profile row: identity, category, address + lat/lng, team, and a verified flag.
       // Heavy details (age, experience, tools/knowledge booleans, etc.) are not stored.
       persist = {
@@ -933,6 +942,7 @@ app.post(
         profile_photo_url: data.profile_photo_url || null,
         banner_url: data.banner_url || null,
         verified,
+        restricted_until: restrictedUntil,
       };
     }
     if (role === 'architect') {
