@@ -849,6 +849,12 @@ const setupSchemas = {
     full_name: z.string().trim().min(2).max(120),
     business_name: z.string().trim().min(2).max(150),
     category_id: z.coerce.number().int().positive(),
+    address: z.string().trim().max(300).nullish().or(z.literal('')),
+    city: z.string().trim().max(80).nullish().or(z.literal('')),
+    state: z.string().trim().max(80).nullish().or(z.literal('')),
+    pincode: z.string().trim().max(20).nullish().or(z.literal('')),
+    latitude: z.coerce.number().min(-90).max(90).nullish(),
+    longitude: z.coerce.number().min(-180).max(180).nullish(),
     profile_photo_url: z.string().url().nullish().or(z.literal('')),
     banner_url: z.string().url().nullish().or(z.literal('')),
     age: z.coerce.number().int().min(18).max(80).nullish(),
@@ -909,13 +915,19 @@ app.post(
     if (role === 'partner') {
       const verified = !!data.has_tools && !!data.knows_work_completely;
       verifiedFlag = verified;
-      // Partners only persist a lean profile row: identity, team, category and a verified flag.
-      // Heavy details (age, experience, address, tools/knowledge booleans, etc.) are not stored.
+      // Partners persist a lean profile row: identity, category, address + lat/lng, team, and a verified flag.
+      // Heavy details (age, experience, tools/knowledge booleans, etc.) are not stored.
       persist = {
         full_name: data.full_name,
         business_name: data.business_name,
         category_id: data.category_id ?? null,
         category_name: data.category_name ?? null,
+        address: data.address || null,
+        city: data.city || null,
+        state: data.state || null,
+        pincode: data.pincode || null,
+        latitude: data.latitude ?? null,
+        longitude: data.longitude ?? null,
         has_team: !!data.has_team,
         team_members_count: data.has_team ? (Number(data.team_members_count) || 0) : 0,
         profile_photo_url: data.profile_photo_url || null,
