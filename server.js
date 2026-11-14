@@ -350,15 +350,8 @@ app.get('/api/health', wrap(async (_req, res) => {
   for (const t of ['users', 'profiles', 'onboarding', 'dashboard', 'user_samples', 'product_listings', 'partner_categories', 'supplier_categories', 'order_assignments', 'admin_panel']) {
     tables[t] = await checkTable(t);
   }
-  const [uColRes, aColRes] = await Promise.all([
-    supabase.from('users').select('email, admin_code').limit(1),
-    supabase.from('admin_panel').select('user_id, email, admin_code').limit(1),
-  ]);
-  const adminColumns = {
-    users_email_admin_code: !uColRes.error,
-    admin_panel_email_admin_code: !aColRes.error,
-  };
-  res.json({ status: 'ok', buckets, tables, adminColumns });
+  const aLegacy = await supabase.from('admin_panel').select('username').limit(1);
+  res.json({ status: 'ok', buckets, tables, adminPanelClean: Boolean(aLegacy.error) });
 }));
 
 // ---------- auth ----------
@@ -2347,7 +2340,7 @@ const findAdminByPhone = async (phone) =>
   db(
     await supabase
       .from('admin_panel')
-      .select('id, phone, username, login_id, host, is_active, bound_at')
+      .select('id, phone, host, is_active, bound_at')
       .eq('phone', phone)
       .limit(1),
   )[0] || null;
@@ -2397,7 +2390,7 @@ app.post(
     const now = new Date().toISOString();
     db(await supabase.from('admin_panel').update({ last_login_at: now, bound_at: admin.bound_at ?? now }).eq('id', admin.id));
     const token = jwt.sign({ sub: admin.id, typ: 'admin', src: 'admin_panel' }, JWT_SECRET, { expiresIn: `${ADMIN_TOKEN_HOURS}h` });
-    res.json({ success: true, token, admin: { id: admin.id, username: admin.username || admin.phone } });
+    res.json({ success: true, token, admin: { id: admin.id, phone: admin.phone, username: admin.phone } });
   }),
 );
 
@@ -2409,7 +2402,7 @@ const getAdmin = async (req) => {
   } catch {
     throw new HttpError(401, 'Login required');
   }
-  const row = db(await supabase.from('admin_panel').select('id, phone, username, is_active, bound_at').eq('id', payload.sub).limit(1))[0];
+  const row = db(await supabase.from('admin_panel').select('id, phone, is_active, bound_at').eq('id', payload.sub).limit(1))[0];
   if (!row?.is_active || !row.bound_at) throw new HttpError(401, 'Login required');
   return row;
 };
@@ -2420,7 +2413,7 @@ app.get(
   adminApiLimiter,
   wrap(async (req, res) => {
     const a = await getAdmin(req);
-    res.json({ success: true, admin: { id: a.id, username: a.username || a.phone || 'Admin' } });
+    res.json({ success: true, admin: { id: a.id, phone: a.phone, username: a.phone || 'Admin' } });
   }),
 );
 
