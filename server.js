@@ -846,7 +846,13 @@ const setupSchemas = {
     shop_years: z.coerce.number().int().min(0).max(100).default(0),
   }),
   partner: z.object({
-    ...profileBase, ...categoryPick, ...ageYears,
+    full_name: z.string().trim().min(2).max(120),
+    business_name: z.string().trim().min(2).max(150),
+    category_id: z.coerce.number().int().positive(),
+    profile_photo_url: z.string().url().nullish().or(z.literal('')),
+    banner_url: z.string().url().nullish().or(z.literal('')),
+    age: z.coerce.number().int().min(18).max(80).nullish(),
+    experience_years: z.coerce.number().int().min(0).max(40).nullish(),
     skill_level: skillLevel.default('intermediate'),
     has_tools: z.boolean(),
     tools_photo_url: z.string().url().nullish().or(z.literal('')),
@@ -898,28 +904,45 @@ app.post(
       if (!cat) throw new HttpError(400, 'Invalid category');
       data.category_name = cat.name;
     }
+    let persist = data;
+    let verifiedFlag = null;
     if (role === 'partner') {
-      if (!data.has_tools || !data.knows_work_completely) {
-        throw new HttpError(400, 'Tool aur knowledge ki confirmation required hai.');
-      }
-      if (data.has_team && !(data.team_members_count > 0)) {
-        throw new HttpError(400, 'Team select kiya hai toh members count zaroori hai.');
-      }
-      if (!data.has_team) data.team_members_count = null;
-      if (data.knows_pricing != null) data.knows_measurement_system = data.knows_pricing;
-      else data.knows_measurement_system = true;
-      data.knows_pricing = true;
-      data.can_deal_with_customers = true;
+      const verified = !!data.has_tools && !!data.knows_work_completely;
+      verifiedFlag = verified;
+      // Partners only persist a lean profile row: identity, team, category and a verified flag.
+      // Heavy details (age, experience, address, tools/knowledge booleans, etc.) are not stored.
+      persist = {
+        full_name: data.full_name,
+        business_name: data.business_name,
+        category_id: data.category_id ?? null,
+        category_name: data.category_name ?? null,
+        has_team: !!data.has_team,
+        team_members_count: data.has_team ? (Number(data.team_members_count) || 0) : 0,
+        profile_photo_url: data.profile_photo_url || null,
+        banner_url: data.banner_url || null,
+        verified,
+      };
     }
     if (role === 'architect') {
       if (data.courses_completed && !data.education) data.education = data.courses_completed;
       delete data.courses_completed;
     }
     const igId = await ensureIgId(req.params.uuid);
-    await updateUser(req.params.uuid, { ...data, ig_id: igId });
+    try {
+      await updateUser(req.params.uuid, { ...persist, ig_id: igId });
+    } catch (err) {
+      // The verified column may not be applied yet; retry without it so onboarding never breaks.
+      if (persist && persist.verified !== undefined && /verified|column|schema|42703|42P01/i.test(String((err && err.message) || ''))) {
+        const { verified, ...rest } = persist;
+        await updateUser(req.params.uuid, { ...rest, ig_id: igId });
+      } else {
+        throw err;
+      }
+    }
     const user = await getUser(req.params.uuid);
     res.json({
       success: true,
+      verified: verifiedFlag,
       card: {
         business_name: user.business_name,
         username: user.username,
@@ -2364,12 +2387,12 @@ app.get(
     await getAdmin(req);
     const onlyOnline = req.query.online === 'true';
     const roleFilter = req.query.role && req.query.role !== 'all' ? String(req.query.role) : null;
-    const profiles = db(
-      await supabase
-        .from('profiles')
-        .select('user_id, full_name, business_name, category_name, skill_level, age, experience_years, shop_years, education, design_software, city, state, address, is_online, payment_status, next_due_at, ig_id, has_team, has_tools, knows_work_completely, users!inner(id, role, username, phone, created_at)')
-        .limit(300),
-    );
+    const profileCols = 'user_id, full_name, business_name, category_name, skill_level, age, experience_years, shop_years, education, design_software, city, state, address, is_online, payment_status, next_due_at, ig_id, has_team, has_tools, knows_work_completely, users!inner(id, role, username, phone, created_at)';
+    let profilesRes = await supabase.from('profiles').select(`${profileCols}, verified`).limit(300);
+    if (profilesRes.error && /verified|column|schema|42703|42P01/i.test(String(profilesRes.error.message || ''))) {
+      profilesRes = await supabase.from('profiles').select(profileCols).limit(300);
+    }
+    const profiles = db(profilesRes);
 
     // Fetch partner private samples for admin evaluation
     let privateSamples = [];
@@ -2423,6 +2446,7 @@ app.get(
           has_team: !!p.has_team,
           has_tools: !!p.has_tools,
           knows_work_completely: !!p.knows_work_completely,
+          verified: !!p.verified,
           private_samples: sampleMap.get(p.user_id) || [],
           created_at: u.created_at,
         };
