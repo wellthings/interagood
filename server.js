@@ -80,6 +80,7 @@ const REFRESH_TTL = JWT_REFRESH_EXPIRES_IN;
 const DAILY_LIMITS = { total: 6, image: 3, video: 3 };
 // Architects and suppliers upload images only (3/day); partners keep the default 6 (3 images + 3 videos).
 const SAMPLE_LIMITS_BY_ROLE = {
+  partner: { total: 4, image: 4, video: 0 },
   architect: { total: 3, image: 3, video: 0 },
   supplier: { total: 3, image: 3, video: 0 },
 };
@@ -1275,7 +1276,7 @@ app.post(
     if (isVideo && !['sample', 'partner_sample', 'supplier_product', 'architect_post', 'product'].includes(kind)) {
       throw new HttpError(400, 'Videos allowed only for samples and product listings');
     }
-    if (isVideo && kind === 'sample' && (req.auth.role === 'architect' || req.auth.role === 'supplier')) {
+    if (isVideo && (kind === 'sample' || kind === 'partner_sample') && ['partner', 'architect', 'supplier'].includes(req.auth.role)) {
       throw new HttpError(400, 'Images only (no video) for this role');
     }
     const folderMap = {
@@ -1393,7 +1394,7 @@ app.post(
     const body = parse(sampleSchema, req.body);
     const quota = await getQuotaForUser(user.id);
     const limits = sampleLimitsFor(user.role);
-    if ((user.role === 'architect' || user.role === 'supplier') && body.media_type === 'video') {
+    if (['partner', 'architect', 'supplier'].includes(user.role) && body.media_type === 'video') {
       throw new HttpError(400, 'Images only (no video) for this role.');
     }
     if (quota.samples.totalUsed >= limits.total) {
@@ -1641,6 +1642,9 @@ app.post(
   auth,
   wrap(async (req, res) => {
     const user = await getUser(req.params.uuid);
+    if (user.role === 'partner') {
+      throw new HttpError(403, 'Product listings are not available for partner accounts.');
+    }
     const b = parse(listingSchema, req.body);
     const quota = await getQuotaForUser(user.id);
     if (quota.products.totalUsed >= PRODUCT_DAILY_LIMIT) {
