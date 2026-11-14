@@ -858,8 +858,6 @@ const skillLevel = z.string().trim().transform((v) => v.toLowerCase()).pipe(z.en
 const setupSchemas = {
   supplier: z.object({
     ...profileBase, ...categoryPick,
-    age: z.coerce.number().int().min(18).max(80).nullish(),
-    experience_years: z.coerce.number().int().min(0).max(40).nullish(),
     shop_years: z.coerce.number().int().min(0).max(100).default(0),
   }),
   partner: z.object({
