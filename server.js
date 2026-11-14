@@ -78,8 +78,11 @@ const UPLOAD_KINDS = ['profile', 'banner', 'sample', 'tools', 'team', 'partner_s
 const ACCESS_TTL = JWT_ACCESS_EXPIRES_IN;
 const REFRESH_TTL = JWT_REFRESH_EXPIRES_IN;
 const DAILY_LIMITS = { total: 6, image: 3, video: 3 };
-// Architects upload images only (3/day); other roles keep the default 6 (3 images + 3 videos).
-const SAMPLE_LIMITS_BY_ROLE = { architect: { total: 3, image: 3, video: 0 } };
+// Architects and suppliers upload images only (3/day); partners keep the default 6 (3 images + 3 videos).
+const SAMPLE_LIMITS_BY_ROLE = {
+  architect: { total: 3, image: 3, video: 0 },
+  supplier: { total: 3, image: 3, video: 0 },
+};
 const sampleLimitsFor = (role) => SAMPLE_LIMITS_BY_ROLE[role] || DAILY_LIMITS;
 const PRODUCT_DAILY_LIMIT = 4;
 
@@ -1269,8 +1272,8 @@ app.post(
     if (isVideo && !['sample', 'partner_sample', 'supplier_product', 'architect_post', 'product'].includes(kind)) {
       throw new HttpError(400, 'Videos allowed only for samples and product listings');
     }
-    if (isVideo && kind === 'sample' && req.auth.role === 'architect') {
-      throw new HttpError(400, 'Architects can upload images only');
+    if (isVideo && kind === 'sample' && (req.auth.role === 'architect' || req.auth.role === 'supplier')) {
+      throw new HttpError(400, 'Images only (no video) for this role');
     }
     const folderMap = {
       profile: 'user_media/profilephoto',
@@ -1387,8 +1390,8 @@ app.post(
     const body = parse(sampleSchema, req.body);
     const quota = await getQuotaForUser(user.id);
     const limits = sampleLimitsFor(user.role);
-    if (user.role === 'architect' && body.media_type === 'video') {
-      throw new HttpError(400, 'Architects can upload images only.');
+    if ((user.role === 'architect' || user.role === 'supplier') && body.media_type === 'video') {
+      throw new HttpError(400, 'Images only (no video) for this role.');
     }
     if (quota.samples.totalUsed >= limits.total) {
       throw new HttpError(429, `Daily limit of ${limits.total} samples reached for today.`);
