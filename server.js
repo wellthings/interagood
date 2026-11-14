@@ -78,6 +78,9 @@ const UPLOAD_KINDS = ['profile', 'banner', 'sample', 'tools', 'team', 'partner_s
 const ACCESS_TTL = JWT_ACCESS_EXPIRES_IN;
 const REFRESH_TTL = JWT_REFRESH_EXPIRES_IN;
 const DAILY_LIMITS = { total: 6, image: 3, video: 3 };
+// Architects upload images only (3/day); other roles keep the default 6 (3 images + 3 videos).
+const SAMPLE_LIMITS_BY_ROLE = { architect: { total: 3, image: 3, video: 0 } };
+const sampleLimitsFor = (role) => SAMPLE_LIMITS_BY_ROLE[role] || DAILY_LIMITS;
 const PRODUCT_DAILY_LIMIT = 4;
 
 const app = express();
@@ -1266,6 +1269,9 @@ app.post(
     if (isVideo && !['sample', 'partner_sample', 'supplier_product', 'architect_post', 'product'].includes(kind)) {
       throw new HttpError(400, 'Videos allowed only for samples and product listings');
     }
+    if (isVideo && kind === 'sample' && req.auth.role === 'architect') {
+      throw new HttpError(400, 'Architects can upload images only');
+    }
     const folderMap = {
       profile: 'user_media/profilephoto',
       banner: 'user_media/banner',
@@ -1380,12 +1386,16 @@ app.post(
     const user = await getUser(req.params.uuid);
     const body = parse(sampleSchema, req.body);
     const quota = await getQuotaForUser(user.id);
-    if (quota.samples.totalUsed >= DAILY_LIMITS.total) {
-      throw new HttpError(429, `Daily limit of ${DAILY_LIMITS.total} samples reached for today.`);
+    const limits = sampleLimitsFor(user.role);
+    if (user.role === 'architect' && body.media_type === 'video') {
+      throw new HttpError(400, 'Architects can upload images only.');
+    }
+    if (quota.samples.totalUsed >= limits.total) {
+      throw new HttpError(429, `Daily limit of ${limits.total} samples reached for today.`);
     }
     const sameType = body.media_type === 'video' ? quota.samples.videosUsed : quota.samples.imagesUsed;
-    if (sameType >= DAILY_LIMITS[body.media_type]) {
-      throw new HttpError(429, `Daily maximum of ${DAILY_LIMITS[body.media_type]} ${body.media_type}s reached.`);
+    if (sameType >= limits[body.media_type]) {
+      throw new HttpError(429, `Daily maximum of ${limits[body.media_type]} ${body.media_type}s reached.`);
     }
     const safePrice = body.price > 0 ? body.price : 1;
     const safeUnit = UNIT_TO_SAMPLE_UNIT[String(body.price_unit || 'pcs').toLowerCase()] || 'pcs';
@@ -1533,6 +1543,8 @@ const listingSchema = z.object({
 
 const getQuotaForUser = async (userId) => {
   const since = startOfTodayIST();
+  const roleRes = await supabase.from('users').select('role').eq('id', userId).maybeSingle();
+  const limits = sampleLimitsFor(roleRes?.data?.role);
   const sampleRes = await supabase.from('user_samples').select('*').eq('user_id', userId).gte('created_at', since);
   let sampleRows = [];
   let fallbackProdRows = [];
@@ -1552,16 +1564,16 @@ const getQuotaForUser = async (userId) => {
     totalUsed: sampleRows.length,
     imagesUsed,
     videosUsed,
-    maxTotal: DAILY_LIMITS.total,
-    maxImages: DAILY_LIMITS.image,
-    maxVideos: DAILY_LIMITS.video,
+    maxTotal: limits.total,
+    maxImages: limits.image,
+    maxVideos: limits.video,
     samples: {
       totalUsed: sampleRows.length,
       imagesUsed,
       videosUsed,
-      maxTotal: DAILY_LIMITS.total,
-      maxImages: DAILY_LIMITS.image,
-      maxVideos: DAILY_LIMITS.video,
+      maxTotal: limits.total,
+      maxImages: limits.image,
+      maxVideos: limits.video,
     },
     products: {
       totalUsed: prodCount,
