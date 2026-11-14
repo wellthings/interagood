@@ -347,10 +347,18 @@ app.get('/api/health', wrap(async (_req, res) => {
     return r.error ? { exists: false, code: r.error.code || null, message: r.error.message } : { exists: true };
   };
   const tables = {};
-  for (const t of ['users', 'profiles', 'onboarding', 'dashboard', 'user_samples', 'product_listings', 'partner_categories', 'supplier_categories', 'order_assignments']) {
+  for (const t of ['users', 'profiles', 'onboarding', 'dashboard', 'user_samples', 'product_listings', 'partner_categories', 'supplier_categories', 'order_assignments', 'admin_panel']) {
     tables[t] = await checkTable(t);
   }
-  res.json({ status: 'ok', buckets, tables });
+  const [uColRes, aColRes] = await Promise.all([
+    supabase.from('users').select('email, admin_code').limit(1),
+    supabase.from('admin_panel').select('user_id, email, admin_code').limit(1),
+  ]);
+  const adminColumns = {
+    users_email_admin_code: !uColRes.error,
+    admin_panel_email_admin_code: !aColRes.error,
+  };
+  res.json({ status: 'ok', buckets, tables, adminColumns });
 }));
 
 // ---------- auth ----------
@@ -536,13 +544,17 @@ app.post(
   }),
 );
 
-const loginSchema = z.object({ identifier: z.string().trim().min(1), password: z.string().min(1) });
+const loginSchema = z.object({
+  identifier: z.string().trim().min(1),
+  phone: phoneSchema.optional(),
+  password: z.string().min(1),
+});
 
 app.post(
   '/api/login',
   authLimiter,
   wrap(async (req, res) => {
-    const { identifier, password } = parse(loginSchema, req.body);
+    const { identifier, phone, password } = parse(loginSchema, req.body);
     const column = identifier.includes('@') ? 'email' : /^[\d+\s-]{10,}$/.test(identifier) ? 'phone' : 'username';
     const value = column === 'phone' ? normalizePhone(identifier) : identifier;
     let user;
@@ -552,7 +564,13 @@ app.post(
     } else {
       user = db(await supabase.from('users').select('*').ilike(column, escapeLike(value)).maybeSingle());
     }
-    if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+    if (!user || user.role === 'admin') {
+      throw new HttpError(401, 'Invalid credentials');
+    }
+    if (phone && user.phone !== phone) {
+      throw new HttpError(401, 'Invalid credentials');
+    }
+    if (!(await bcrypt.compare(password, user.password_hash))) {
       throw new HttpError(401, 'Invalid credentials');
     }
     const fullUser = await getUser(user.id).catch(() => null);
@@ -2325,8 +2343,39 @@ const adminFailed = (phone) => {
   if (adminFails.size > 2000) for (const [k, v] of adminFails) if (Date.now() - v.first > ADMIN_FAIL_WINDOW_MS) adminFails.delete(k);
 };
 
-const findAdminByPhone = async (phone) =>
-  db(await supabase.from('admin_panel').select('id, phone, username, login_id, host, is_active, bound_at').eq('phone', phone).limit(1))[0];
+const findAdminByPhone = async (phone) => {
+  let res = await supabase
+    .from('admin_panel')
+    .select('id, phone, username, login_id, host, is_active, bound_at, user_id, email, admin_code')
+    .eq('phone', phone)
+    .limit(1);
+  if (res.error && /user_id|email|admin_code|column|42703/i.test(String(res.error.message || ''))) {
+    res = await supabase
+      .from('admin_panel')
+      .select('id, phone, username, login_id, host, is_active, bound_at')
+      .eq('phone', phone)
+      .limit(1);
+  }
+  return db(res)[0] || null;
+};
+
+const findAdminUserByPhone = async (phone) => {
+  let res = await supabase
+    .from('users')
+    .select('id, role, username, phone, password_hash, email, admin_code')
+    .eq('phone', phone)
+    .eq('role', 'admin')
+    .limit(1);
+  if (res.error && /email|admin_code|column|42703/i.test(String(res.error.message || ''))) {
+    res = await supabase
+      .from('users')
+      .select('id, role, username, phone, password_hash')
+      .eq('phone', phone)
+      .eq('role', 'admin')
+      .limit(1);
+  }
+  return db(res)[0] || null;
+};
 
 // Always answers the same way, so it cannot be used to find out which numbers are admins
 app.post(
@@ -2341,13 +2390,16 @@ app.post(
   }),
 );
 
-const adminLoginSchema = z.object({
-  phone: phoneSchema,
-  otp: z.string().trim().optional().default(''),
-  password: z.string().optional().default(''),
-  username: z.string().trim().min(1).max(100),
-  login_id: z.string().trim().min(1).max(100),
-});
+const adminLoginSchema = z
+  .object({
+    phone: phoneSchema,
+    password: z.string().min(1).max(100),
+    username: z.string().trim().min(1).max(100),
+    email: z.string().trim().email().max(150),
+    admin_code: z.string().trim().min(1).max(100).optional(),
+    login_id: z.string().trim().min(1).max(100).optional(),
+  })
+  .refine((d) => Boolean(d.admin_code || d.login_id), { message: 'Invalid credentials' });
 
 app.post(
   '/api/admin/login',
@@ -2357,49 +2409,84 @@ app.post(
     if (adminLocked(b.phone)) throw new HttpError(429, 'Too many failed attempts. Try again after 15 minutes.');
     const reject = () => {
       adminFailed(b.phone);
-      throw new HttpError(401, 'Invalid admin credentials');
+      throw new HttpError(401, 'Invalid credentials');
     };
-    const admin = await findAdminByPhone(b.phone);
-    if (!admin || !admin.is_active) return reject();
-    const detailsOk = admin.username.toLowerCase() === b.username.toLowerCase() && admin.login_id === b.login_id;
-    if (!detailsOk) return reject();
 
-    // Verify password against host hash if provided, or verify OTP
-    let verified = false;
-    if (b.password) {
-      verified = await bcrypt.compare(b.password, admin.host || DUMMY_HASH);
-    }
-    if (!verified && /^\d{4,8}$/.test(b.otp || '')) {
-      if (b.otp === '000000' && (!FAST2SMS_API_KEY || !FAST2SMS_OTP_ID)) {
-        verified = true;
-      } else {
-        const otp = await fast2sms('verify', { mobile: b.phone, otp: b.otp });
-        if (otp.status >= 500) throw new HttpError(502, 'Could not verify OTP, please try again');
-        verified = otp.ok;
+    const [admin, adminUser] = await Promise.all([
+      findAdminByPhone(b.phone),
+      findAdminUserByPhone(b.phone),
+    ]);
+
+    const submittedUser = b.username.trim().toLowerCase();
+    const submittedEmail = b.email.trim().toLowerCase();
+    const submittedCode = (b.admin_code || b.login_id || '').trim();
+
+    if (admin) {
+      if (!admin.is_active) return reject();
+      const expectedEmail = (admin.email || (adminUser && adminUser.email) || '').trim().toLowerCase();
+      const expectedCode = (admin.admin_code || admin.login_id || (adminUser && adminUser.admin_code) || '').trim();
+      const detailsOk =
+        admin.username.trim().toLowerCase() === submittedUser &&
+        expectedCode &&
+        expectedCode === submittedCode &&
+        expectedEmail &&
+        expectedEmail === submittedEmail;
+      if (!detailsOk) return reject();
+
+      let verified = await bcrypt.compare(b.password, admin.host || DUMMY_HASH);
+      if (!verified && adminUser?.password_hash) {
+        verified = await bcrypt.compare(b.password, adminUser.password_hash);
       }
-    }
-    if (!verified) return reject();
+      if (!verified) return reject();
 
-    otpSends.delete(b.phone);
-    adminFails.delete(b.phone);
-    const now = new Date().toISOString();
-    db(await supabase.from('admin_panel').update({ last_login_at: now, bound_at: admin.bound_at ?? now }).eq('id', admin.id));
-    const token = jwt.sign({ sub: admin.id, typ: 'admin' }, JWT_SECRET, { expiresIn: `${ADMIN_TOKEN_HOURS}h` });
-    res.json({ success: true, token, admin: { id: admin.id, username: admin.username } });
+      otpSends.delete(b.phone);
+      adminFails.delete(b.phone);
+      const now = new Date().toISOString();
+      db(await supabase.from('admin_panel').update({ last_login_at: now, bound_at: admin.bound_at ?? now }).eq('id', admin.id));
+      const token = jwt.sign({ sub: admin.id, typ: 'admin', src: 'admin_panel' }, JWT_SECRET, { expiresIn: `${ADMIN_TOKEN_HOURS}h` });
+      return res.json({ success: true, token, admin: { id: admin.id, username: admin.username } });
+    }
+
+    if (adminUser) {
+      const expectedEmail = (adminUser.email || '').trim().toLowerCase();
+      const expectedCode = (adminUser.admin_code || '').trim();
+      const detailsOk =
+        adminUser.username.trim().toLowerCase() === submittedUser &&
+        adminUser.phone === b.phone &&
+        expectedCode &&
+        expectedCode === submittedCode &&
+        expectedEmail &&
+        expectedEmail === submittedEmail;
+      if (!detailsOk) return reject();
+
+      const verified = await bcrypt.compare(b.password, adminUser.password_hash || DUMMY_HASH);
+      if (!verified) return reject();
+
+      otpSends.delete(b.phone);
+      adminFails.delete(b.phone);
+      const token = jwt.sign({ sub: adminUser.id, typ: 'admin', src: 'users' }, JWT_SECRET, { expiresIn: `${ADMIN_TOKEN_HOURS}h` });
+      return res.json({ success: true, token, admin: { id: adminUser.id, username: adminUser.username } });
+    }
+
+    return reject();
   }),
 );
 
 const getAdmin = async (req) => {
-  let id;
+  let payload;
   try {
-    const payload = jwt.verify((req.headers.authorization || '').replace(/^Bearer /, ''), JWT_SECRET);
+    payload = jwt.verify((req.headers.authorization || '').replace(/^Bearer /, ''), JWT_SECRET);
     if (payload.typ !== 'admin') throw new Error();
-    id = payload.sub;
   } catch {
-    throw new HttpError(401, 'Admin login required');
+    throw new HttpError(401, 'Login required');
   }
-  const row = db(await supabase.from('admin_panel').select('id, username, is_active, bound_at').eq('id', id).limit(1))[0];
-  if (!row?.is_active || !row.bound_at) throw new HttpError(401, 'Admin login required');
+  if (payload.src === 'users') {
+    const u = db(await supabase.from('users').select('id, username, role').eq('id', payload.sub).eq('role', 'admin').limit(1))[0];
+    if (!u) throw new HttpError(401, 'Login required');
+    return u;
+  }
+  const row = db(await supabase.from('admin_panel').select('id, username, is_active, bound_at').eq('id', payload.sub).limit(1))[0];
+  if (!row?.is_active || !row.bound_at) throw new HttpError(401, 'Login required');
   return row;
 };
 const adminApiLimiter = rateLimit({ windowMs: 60_000, limit: 120, standardHeaders: true, legacyHeaders: false });
@@ -2529,7 +2616,7 @@ app.get(
           created_at: u.created_at,
         };
       })
-      .filter((u) => (!roleFilter || u.role === roleFilter) && (!onlyOnline || u.is_online));
+      .filter((u) => u.role !== 'admin' && (!roleFilter || u.role === roleFilter) && (!onlyOnline || u.is_online));
 
     res.json({ success: true, data: list });
   }),
