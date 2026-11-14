@@ -1631,8 +1631,8 @@ app.post(
     const subtotal = Math.round(b.rate_per_unit * b.quantity * 100) / 100;
     const expectedAmt = b.expected_amount != null ? Number(b.expected_amount) : subtotal;
     const isPrivate = !!b.is_private;
-    // with_material stays locked TRUE exclusively for Architect; FALSE for Partner & Supplier
-    const withMaterial = user.role === 'architect';
+    // with_material now follows the client payload (defaults to FALSE); it is not forced on any role.
+    const withMaterial = b.with_material === true;
 
     const baseListing = {
       user_id: user.id,
