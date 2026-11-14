@@ -23,6 +23,7 @@ ALTER TABLE admin_panel
   ALTER COLUMN id SET DEFAULT gen_random_uuid();
 
 ALTER TABLE admin_panel
+  DROP CONSTRAINT IF EXISTS admin_panel_id_fkey,
   DROP CONSTRAINT IF EXISTS admin_panel_username_check,
   DROP CONSTRAINT IF EXISTS admin_panel_login_id_check,
   DROP CONSTRAINT IF EXISTS admin_panel_username_key,
