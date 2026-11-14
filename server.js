@@ -516,16 +516,19 @@ app.post(
         .select('id, role')
         .single(),
     );
-    const profileInserts = [
-      supabase.from('profiles').insert({ user_id: user.id }),
-      supabase.from('onboarding').insert({ user_id: user.id, terms_accepted: true }),
-      supabase.from('dashboard').insert({ user_id: user.id }),
-    ];
-    const results = await Promise.all(profileInserts);
-    const profileError = results.find((r) => r && r.error);
+    const { error: baseProfileErr } = await supabase.from('profiles').insert({ user_id: user.id });
+    let profileError = baseProfileErr || null;
+    if (!profileError) {
+      const results = await Promise.all([
+        supabase.from('onboarding').insert({ user_id: user.id, terms_accepted: true }),
+        supabase.from('dashboard').insert({ user_id: user.id }),
+      ]);
+      const subErr = results.find((r) => r && r.error);
+      if (subErr) profileError = subErr.error;
+    }
     if (profileError) {
       await supabase.from('users').delete().eq('id', user.id);
-      console.error('[supabase]', profileError.error);
+      console.error('[supabase]', profileError);
       throw new HttpError(500, 'Database error');
     }
     res.status(201).json({ success: true, uuid: user.id, role: user.role, ...signTokens(user) });
