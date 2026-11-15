@@ -350,8 +350,11 @@ app.get('/api/health', wrap(async (_req, res) => {
   for (const t of ['users', 'profiles', 'onboarding', 'dashboard', 'user_samples', 'product_listings', 'partner_categories', 'supplier_categories', 'order_assignments', 'admin_panel']) {
     tables[t] = await checkTable(t);
   }
-  const aLegacy = await supabase.from('admin_panel').select('username').limit(1);
-  res.json({ status: 'ok', buckets, tables, adminPanelClean: Boolean(aLegacy.error) });
+  const [aLegacy, aPass] = await Promise.all([
+    supabase.from('admin_panel').select('username').limit(1),
+    supabase.from('admin_panel').select('password').limit(1),
+  ]);
+  res.json({ status: 'ok', buckets, tables, adminPanelClean: Boolean(aLegacy.error), adminPanelHasPassword: !aPass.error });
 }));
 
 // ---------- auth ----------
@@ -2336,14 +2339,21 @@ const adminFailed = (phone) => {
   if (adminFails.size > 2000) for (const [k, v] of adminFails) if (Date.now() - v.first > ADMIN_FAIL_WINDOW_MS) adminFails.delete(k);
 };
 
-const findAdminByPhone = async (phone) =>
-  db(
-    await supabase
+const findAdminByPhone = async (phone) => {
+  let res = await supabase
+    .from('admin_panel')
+    .select('id, phone, password, is_active, bound_at')
+    .eq('phone', phone)
+    .limit(1);
+  if (res.error && /password|column|42703/i.test(String(res.error.message || ''))) {
+    res = await supabase
       .from('admin_panel')
       .select('id, phone, host, is_active, bound_at')
       .eq('phone', phone)
-      .limit(1),
-  )[0] || null;
+      .limit(1);
+  }
+  return db(res)[0] || null;
+};
 
 // Always answers the same way, so it cannot be used to find out which numbers are admins
 app.post(
@@ -2378,7 +2388,7 @@ app.post(
     const admin = await findAdminByPhone(b.phone);
     if (!admin || !admin.is_active) return reject();
 
-    const passOk = await bcrypt.compare(b.password, admin.host || DUMMY_HASH);
+    const passOk = await bcrypt.compare(b.password, admin.password || admin.host || DUMMY_HASH);
     if (!passOk) return reject();
 
     const otpRes = await fast2sms('verify', { mobile: b.phone, otp: b.otp });
