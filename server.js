@@ -9,7 +9,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { z } from 'zod';
 import { createClient } from '@supabase/supabase-js';
-import { isPayuConfigured, buildPayuOrder, verifyPayuHash } from './payu.js';
+import { isPayuConfigured, getPayuConfigSummary, buildPayuOrder, verifyPayuHash, verifyPayuTransaction } from './payu.js';
 
 const {
   PORT = 3000,
@@ -272,10 +272,63 @@ const assertActive = async (id) => {
   if (!isPaymentActive(user)) throw new HttpError(402, 'Subscription is not active. Please complete the payment first.');
 };
 const requireActive = wrap(async (req, _res, next) => {
-  const liveBilling = isPayuConfigured() || (!!RAZORPAY_KEY_ID && !!RAZORPAY_KEY_SECRET);
-  if (liveBilling) await assertActive(req.params.uuid);
+  await assertActive(req.params.uuid);
   next();
 });
+const effectivePaymentStatus = (user) => {
+  if (!user) return 'unpaid';
+  if (isPaymentActive(user)) return 'paid';
+  if (user.payment_status === 'paid' && user.next_due_at && new Date(user.next_due_at).getTime() <= Date.now()) {
+    return 'expired';
+  }
+  return user.payment_status || 'unpaid';
+};
+const resolveReturnOrigin = (rawOrigin) => {
+  const fallback = String(APP_URL || 'https://interagood.in').replace(/\/+$/, '');
+  if (!rawOrigin || typeof rawOrigin !== 'string') return fallback;
+  try {
+    const u = new URL(rawOrigin);
+    const host = u.hostname.toLowerCase();
+    if (
+      host === 'interagood.in' ||
+      host === 'www.interagood.in' ||
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host.endsWith('.run.app')
+    ) {
+      return `${u.protocol}//${u.host}`;
+    }
+  } catch {}
+  return fallback;
+};
+const recordPaymentInit = async (row) => {
+  try {
+    const { error } = await supabase.from('payment_transactions').insert(row);
+    if (error && !isMissingTableErr(error)) console.error('[payu init db]', error.message);
+  } catch (e) {
+    console.warn('[payu init db]', e?.message || e);
+  }
+};
+const getPaymentTx = async (txnid) => {
+  try {
+    const { data, error } = await supabase.from('payment_transactions').select('*').eq('txnid', txnid).maybeSingle();
+    if (error && !isMissingTableErr(error)) console.error('[payu get tx]', error.message);
+    return data || null;
+  } catch {
+    return null;
+  }
+};
+const updatePaymentTx = async (txnid, updates) => {
+  try {
+    const { error } = await supabase
+      .from('payment_transactions')
+      .update({ ...updates, updated_at: new Date().toISOString() })
+      .eq('txnid', txnid);
+    if (error && !isMissingTableErr(error)) console.error('[payu update tx]', error.message);
+  } catch (e) {
+    console.warn('[payu update tx]', e?.message || e);
+  }
+};
 
 // Monthly one-time plan per role (no AutoPay). Amount is charged once per paid cycle.
 const PLANS = {
@@ -347,14 +400,14 @@ app.get('/api/health', wrap(async (_req, res) => {
     return r.error ? { exists: false, code: r.error.code || null, message: r.error.message } : { exists: true };
   };
   const tables = {};
-  for (const t of ['users', 'profiles', 'onboarding', 'dashboard', 'user_samples', 'product_listings', 'partner_categories', 'supplier_categories', 'order_assignments', 'admin_panel']) {
+  for (const t of ['users', 'profiles', 'onboarding', 'dashboard', 'user_samples', 'product_listings', 'partner_categories', 'supplier_categories', 'order_assignments', 'admin_panel', 'payment_transactions']) {
     tables[t] = await checkTable(t);
   }
   const [aLegacy, aPass] = await Promise.all([
     supabase.from('admin_panel').select('username').limit(1),
     supabase.from('admin_panel').select('password').limit(1),
   ]);
-  res.json({ status: 'ok', buckets, tables, adminPanelClean: Boolean(aLegacy.error), adminPanelHasPassword: !aPass.error });
+  res.json({ status: 'ok', buckets, tables, adminPanelClean: Boolean(aLegacy.error), adminPanelHasPassword: !aPass.error, payu: getPayuConfigSummary() });
 }));
 
 // ---------- auth ----------
@@ -570,17 +623,21 @@ app.post(
       throw new HttpError(401, 'Invalid credentials');
     }
     const fullUser = await getUser(user.id).catch(() => null);
+    const paymentActive = fullUser ? isPaymentActive(fullUser) : false;
+    const effPaymentStatus = effectivePaymentStatus(fullUser);
     res.json({
       success: true,
       uuid: user.id,
       role: user.role,
       username: user.username,
-      payment_status: fullUser?.payment_status || "unpaid",
-      is_online: !!fullUser?.is_online,
+      payment_status: effPaymentStatus,
+      payment_active: paymentActive,
+      next_due_at: fullUser?.next_due_at || null,
+      is_online: paymentActive && !!fullUser?.is_online,
       profile_completed: !!fullUser?.business_name,
       verified: fullUser?.verified !== undefined ? !!fullUser.verified : null,
       restricted_until: fullUser?.restricted_until || null,
-      profile: fullUser ? sanitizeUser(fullUser) : null,
+      profile: fullUser ? { ...sanitizeUser(fullUser), payment_status: effPaymentStatus, payment_active: paymentActive } : null,
       ...signTokens(user),
     });
   }),
@@ -1105,76 +1162,203 @@ app.post(
 );
 
 // ---------- payu payment (monthly one-time; no AutoPay) ----------
+const payuPostbackSchema = z.object({
+  status: z.string(),
+  txnid: z.string(),
+  amount: z.string(),
+  productinfo: z.string(),
+  firstname: z.string().nullish(),
+  email: z.string().nullish(),
+  key: z.string().nullish(),
+  hash: z.string(),
+  mihpayid: z.string().nullish(),
+  mode: z.string().nullish(),
+  additionalCharges: z.string().nullish(),
+  additional_charges: z.string().nullish(),
+  udf1: z.string().nullish(),
+  udf2: z.string().nullish(),
+  udf3: z.string().nullish(),
+  udf4: z.string().nullish(),
+  udf5: z.string().nullish(),
+}).passthrough();
+
+const processPayuPostback = async (postback) => {
+  const origin = resolveReturnOrigin(postback.udf2);
+  if (!verifyPayuHash(postback)) {
+    return { ok: false, reason: 'hash', origin };
+  }
+  const userId = (postback.udf1 || '').split('|')[0].trim();
+  if (!z.string().uuid().safeParse(userId).success) {
+    return { ok: false, reason: 'user', origin };
+  }
+  let user;
+  try {
+    user = await getUser(userId);
+  } catch {
+    return { ok: false, reason: 'user', origin };
+  }
+  const plan = PLANS[user.role];
+  const expectedAmount = plan ? Number((plan.amountPaise / 100).toFixed(2)) : null;
+  const existingTx = await getPaymentTx(postback.txnid);
+  const returnOrigin = resolveReturnOrigin(existingTx?.return_origin || postback.udf2);
+  const normalizedStatus = String(postback.status || '').trim().toLowerCase();
+
+  if (normalizedStatus !== 'success') {
+    await updatePaymentTx(postback.txnid, {
+      status: normalizedStatus === 'usercancelled' || normalizedStatus === 'cancelled' ? 'cancelled' : 'failed',
+      mihpayid: postback.mihpayid || null,
+      mode: postback.mode || null,
+      raw_postback: postback,
+    });
+    return { ok: false, reason: 'status', origin: returnOrigin };
+  }
+  if (!expectedAmount || !Number.isFinite(Number(postback.amount)) || Math.abs(Number(postback.amount) - expectedAmount) > 0.01) {
+    await updatePaymentTx(postback.txnid, { status: 'failed', raw_postback: postback });
+    return { ok: false, reason: 'amount', origin: returnOrigin };
+  }
+
+  // Idempotency: if already marked success and subscriber already activated for this cycle, succeed cleanly
+  if (existingTx && existingTx.status === 'success' && isPaymentActive(user)) {
+    return { ok: true, txnid: postback.txnid, origin: returnOrigin };
+  }
+
+  // Defense-in-depth: confirm with PayU verify_payment S2S API when reachable
+  const s2s = await verifyPayuTransaction(postback.txnid);
+  if (s2s.conclusive) {
+    if (!s2s.verified || (s2s.amount != null && Math.abs(Number(s2s.amount) - expectedAmount) > 0.01)) {
+      await updatePaymentTx(postback.txnid, {
+        status: 'failed',
+        mihpayid: s2s.mihpayid || postback.mihpayid || null,
+        mode: s2s.mode || postback.mode || null,
+        raw_postback: { postback, s2s: s2s.raw || null },
+      });
+      return { ok: false, reason: 'verify', origin: returnOrigin };
+    }
+  }
+
+  try {
+    await activateSubscriber(userId, postback.txnid);
+    await updatePaymentTx(postback.txnid, {
+      status: 'success',
+      mihpayid: s2s.mihpayid || postback.mihpayid || null,
+      mode: s2s.mode || postback.mode || null,
+      raw_postback: postback,
+      verified_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    if (err.status !== 404) throw err;
+    return { ok: false, reason: 'activate', origin: returnOrigin };
+  }
+  return { ok: true, txnid: postback.txnid, origin: returnOrigin };
+};
+
 // Init: the amount and customer details come from the server (never the client).
 app.post(
   '/api/payments/payu/init',
   auth,
   wrap(async (req, res) => {
-    if (!isPayuConfigured()) throw new HttpError(503, 'PayU is not configured');
+    if (!isPayuConfigured()) throw new HttpError(503, 'PayU is not configured on the server');
     const user = await getUser(req.auth.sub);
     const plan = PLANS[user.role];
     if (!plan) throw new HttpError(403, 'No plan available for this role');
+    const returnOrigin = resolveReturnOrigin(req.body?.returnOrigin || req.get('origin'));
     const publicApi = API_PUBLIC_URL || `${req.protocol}://${req.get('host')}`;
     const txnid = `ig${Date.now()}${Math.floor(Math.random() * 900 + 100)}`;
+    const amountStr = (plan.amountPaise / 100).toFixed(2);
+    await recordPaymentInit({
+      txnid,
+      user_id: user.id,
+      role: user.role,
+      purpose: 'subscription',
+      amount: Number(amountStr),
+      status: 'pending',
+      return_origin: returnOrigin,
+    });
     const order = buildPayuOrder({
       txnid,
-      amount: (plan.amountPaise / 100).toFixed(2),
+      amount: amountStr,
       productinfo: `${plan.name} - monthly`.slice(0, 100),
       firstname: String(user.full_name || user.business_name || user.username || 'Customer').slice(0, 60),
       email: user.email || `${normalizePhone(user.phone)}@interagood.in`,
       phone: normalizePhone(user.phone),
       udf1: user.id,
+      udf2: returnOrigin,
+      udf3: user.role,
+      udf4: 'subscription',
       surl: `${publicApi}/api/payments/payu/return`,
       furl: `${publicApi}/api/payments/payu/return`,
     });
-    res.json({ success: true, order });
+    res.json({ success: true, txnid, amount: Number(amountStr), mode: getPayuConfigSummary().mode, order });
   }),
 );
-
-// PayU posts the result back here (surl/furl). Verify the hash, activate the paid cycle, then return to the app.
+// PayU posts the result back here (surl/furl). Verify the hash + verify_payment, activate the paid cycle, then return to the app.
 app.post(
   '/api/payments/payu/return',
   wrap(async (req, res) => {
     if (!isPayuConfigured()) throw new HttpError(503, 'PayU is not configured');
-    const fail = (reason) => res.redirect(`${APP_URL}/payment-return.html?status=failure&reason=${encodeURIComponent(reason)}`);
-    const postback = parse(
-      z.object({
-        status: z.string(),
-        txnid: z.string(),
-        amount: z.string(),
-        productinfo: z.string(),
-        firstname: z.string().nullish(),
-        email: z.string().nullish(),
-        key: z.string().nullish(),
-        hash: z.string(),
-        udf1: z.string().nullish(),
-        udf2: z.string().nullish(),
-        udf3: z.string().nullish(),
-        udf4: z.string().nullish(),
-        udf5: z.string().nullish(),
-      }),
-      req.body,
-    );
-    if (!verifyPayuHash(postback)) return fail('hash');
-    const userId = (postback.udf1 || '').split('|')[0];
-    if (!z.string().uuid().safeParse(userId).success) return fail('user');
-    let user;
-    try {
-      user = await getUser(userId);
-    } catch {
-      return fail('user');
+    const postback = parse(payuPostbackSchema, req.body);
+    const result = await processPayuPostback(postback);
+    if (!result.ok) {
+      return res.redirect(`${result.origin}/payment-return.html?status=failure&reason=${encodeURIComponent(result.reason)}&txnid=${encodeURIComponent(postback.txnid || '')}`);
+    }
+    res.redirect(`${result.origin}/payment-return.html?status=success&txnid=${encodeURIComponent(result.txnid)}`);
+  }),
+);
+// PayU S2S Webhook (configure in PayU Merchant Dashboard -> Webhook URL)
+app.post(
+  '/api/payments/payu/webhook',
+  wrap(async (req, res) => {
+    if (!isPayuConfigured()) throw new HttpError(503, 'PayU is not configured');
+    const postback = parse(payuPostbackSchema, req.body);
+    const result = await processPayuPostback(postback);
+    if (!result.ok && result.reason === 'hash') {
+      throw new HttpError(400, 'Invalid PayU signature');
+    }
+    res.json({ success: result.ok, reason: result.reason || null });
+  }),
+);
+// Authenticated fallback verification check for payment-return.html
+app.get(
+  '/api/payments/payu/verify/:txnid',
+  auth,
+  wrap(async (req, res) => {
+    if (!isPayuConfigured()) throw new HttpError(503, 'PayU is not configured');
+    const user = await getUser(req.auth.sub);
+    const txnid = String(req.params.txnid || '').trim();
+    if (!txnid || txnid.length > 64) throw new HttpError(400, 'Invalid transaction id');
+    const existingTx = await getPaymentTx(txnid);
+    if (existingTx && existingTx.user_id !== user.id) {
+      throw new HttpError(403, 'Transaction does not belong to this account');
+    }
+    if (isPaymentActive(user) && existingTx?.status === 'success') {
+      return res.json({ success: true, verified: true, payment_status: 'paid', next_due_at: user.next_due_at });
     }
     const plan = PLANS[user.role];
-    const expectedAmount = plan ? (plan.amountPaise / 100).toFixed(2) : null;
-    if (postback.status !== 'success') return fail('status');
-    if (!expectedAmount || Number(postback.amount) !== Number(expectedAmount)) return fail('amount');
-    try {
-      await activateSubscriber(userId, postback.txnid);
-    } catch (err) {
-      if (err.status !== 404) throw err;
-      return fail('activate');
+    const expectedAmount = plan ? Number((plan.amountPaise / 100).toFixed(2)) : null;
+    const s2s = await verifyPayuTransaction(txnid);
+    if (
+      s2s.conclusive &&
+      s2s.verified &&
+      expectedAmount &&
+      (s2s.amount == null || Math.abs(Number(s2s.amount) - expectedAmount) <= 0.01) &&
+      (existingTx || (s2s.raw?.udf1 && String(s2s.raw.udf1) === user.id))
+    ) {
+      await activateSubscriber(user.id, txnid);
+      await updatePaymentTx(txnid, {
+        status: 'success',
+        mihpayid: s2s.mihpayid || null,
+        mode: s2s.mode || null,
+        verified_at: new Date().toISOString(),
+      });
+      const refreshed = await getUser(user.id);
+      return res.json({ success: true, verified: true, payment_status: 'paid', next_due_at: refreshed.next_due_at });
     }
-    res.redirect(`${APP_URL}/payment-return.html?status=success`);
+    res.json({
+      success: false,
+      verified: false,
+      payment_status: effectivePaymentStatus(user),
+      status: s2s.status || existingTx?.status || 'pending',
+    });
   }),
 );
 
@@ -1239,25 +1423,26 @@ app.get(
       db(smpRes);
     }
     const samples = await resolveSampleUrls(await withVotes(rawSamples, user.id));
-    res.json({ success: true, data: { ...sanitizeUser(user), samples } });
+    const paymentActive = isPaymentActive(user);
+    const effStatus = effectivePaymentStatus(user);
+    res.json({
+      success: true,
+      data: {
+        ...sanitizeUser(user),
+        payment_status: effStatus,
+        payment_active: paymentActive,
+        is_online: paymentActive && !!user.is_online,
+        samples,
+      },
+    });
   }),
 );
 
 app.post(
   '/api/payments/payu/sandbox-activate',
   auth,
-  wrap(async (req, res) => {
-    const user = await getUser(req.auth.sub);
-    const txnid = String(req.body?.txnid || ('PAYU_SANDBOX_' + Date.now()));
-    await activateSubscriber(user.id, txnid);
-    const updated = await getUser(user.id);
-    res.json({
-      success: true,
-      txnid,
-      payment_status: updated.payment_status,
-      next_due_at: updated.next_due_at,
-      is_online: !!updated.is_online,
-    });
+  wrap(async (_req, _res) => {
+    throw new HttpError(410, 'Sandbox bypass is disabled. Please complete payment via PayU checkout.');
   }),
 );
 
@@ -1266,8 +1451,7 @@ app.patch(
   auth,
   wrap(async (req, res) => {
     const user = await getUser(req.params.uuid);
-    const liveBilling = isPayuConfigured() || (!!RAZORPAY_KEY_ID && !!RAZORPAY_KEY_SECRET);
-    if (liveBilling && !isPaymentActive(user)) {
+    if (!isPaymentActive(user)) {
       throw new HttpError(402, 'Subscription is not active. Please complete the payment first.');
     }
     const { is_online } = parse(z.object({ is_online: z.boolean() }), req.body);
@@ -1304,8 +1488,9 @@ app.post(
       tools: 'user_media/tools',
       team: 'user_media/team',
     };
-    const liveBilling = isPayuConfigured() || (!!RAZORPAY_KEY_ID && !!RAZORPAY_KEY_SECRET);
-    if (liveBilling && (kind === 'sample' || kind === 'partner_sample')) await assertActive(req.params.uuid);
+    if (['sample', 'partner_sample', 'architect_post', 'supplier_product', 'product'].includes(kind)) {
+      await assertActive(req.params.uuid);
+    }
     const bucketMap = {
       profile: STORAGE_BUCKET, banner: STORAGE_BUCKET, sample: STORAGE_BUCKET,
       tools: STORAGE_BUCKET, team: STORAGE_BUCKET,
@@ -1654,6 +1839,7 @@ app.get(
 app.post(
   '/api/users/:uuid/listings',
   auth,
+  requireActive,
   wrap(async (req, res) => {
     const user = await getUser(req.params.uuid);
     if (user.role === 'partner') {
