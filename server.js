@@ -403,7 +403,7 @@ app.get('/api/health', wrap(async (_req, res) => {
     return r.error ? { exists: false, code: r.error.code || null, message: r.error.message } : { exists: true };
   };
   const tables = {};
-  for (const t of ['users', 'profiles', 'onboarding', 'dashboard', 'user_samples', 'product_listings', 'partner_categories', 'supplier_categories', 'order_assignments', 'admin_panel', 'payment_transactions']) {
+  for (const t of ['users', 'profiles', 'onboarding', 'dashboard', 'user_samples', 'product_listings', 'partner_categories', 'partner_repairing_services', 'supplier_categories', 'order_assignments', 'admin_panel', 'payment_transactions']) {
     tables[t] = await checkTable(t);
   }
   const [aLegacy, aPass] = await Promise.all([
@@ -666,13 +666,44 @@ app.post(
 // ---------- master data ----------
 const categoryRoute = (table) =>
   wrap(async (_req, res) => {
-    const rows = db(await supabase.from(table).select('id, name, hindi_name, icon_name').eq('is_active', true).order('id'));
+    const rows = db(await supabase.from(table).select('*').eq('is_active', true).order('id'));
     res.json({ success: true, data: rows.map(({ icon_name, ...c }) => ({ ...c, icon: icon_name })) });
   });
 
 app.get('/api/categories/partner', categoryRoute('partner_categories'));
 app.get('/api/categories/supplier', categoryRoute('supplier_categories'));
 app.get('/api/partner_category', categoryRoute('partner_categories'));
+app.get(
+  '/api/categories/partner/repairs',
+  wrap(async (req, res) => {
+    const rawCatId = req.query.category_id ? Number(req.query.category_id) : null;
+    if (req.query.category_id && (!Number.isInteger(rawCatId) || rawCatId < 1)) {
+      throw new HttpError(400, 'Invalid category_id');
+    }
+    let q = supabase
+      .from('partner_repairing_services')
+      .select('id, category_id, category_name, repairing_service, sort_order, is_active')
+      .eq('is_active', true)
+      .order('category_id')
+      .order('sort_order');
+    if (rawCatId) q = q.eq('category_id', rawCatId);
+    const r = await q;
+    if (!r.error && Array.isArray(r.data) && r.data.length) {
+      return res.json({ success: true, data: r.data });
+    }
+    let cq = supabase.from('partner_categories').select('*').eq('is_active', true).order('id');
+    if (rawCatId) cq = cq.eq('id', rawCatId);
+    const cats = db(await cq);
+    const flat = [];
+    for (const c of cats) {
+      const list = Array.isArray(c.repairing_services) ? c.repairing_services : [];
+      list.forEach((srv, idx) => {
+        flat.push({ id: null, category_id: c.id, category_name: c.name, repairing_service: srv, sort_order: idx + 1, is_active: true });
+      });
+    }
+    res.json({ success: true, data: flat });
+  }),
+);
 
 app.get(
   '/api/measurement-units',
