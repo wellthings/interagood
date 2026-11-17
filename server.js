@@ -264,6 +264,9 @@ const updateUser = async (id, updates) => {
 
 // No AutoPay: the subscription is active only while the last monthly payment is valid.
 // A profile is paid while payment_status = 'paid' and its next_due_at has not passed yet.
+// Temporary Test Mode toggle while designing UI (set PAYMENT_TEST_MODE=false on Railway or change to false for live PayU enforcement)
+const PAYMENT_TEST_MODE = process.env.PAYMENT_TEST_MODE !== 'false';
+
 const isPaymentActive = (user) =>
   user.payment_status === 'paid' && (!user.next_due_at || new Date(user.next_due_at).getTime() > Date.now());
 // Home features (samples, online status, business cards) are only available while the payment is active
@@ -407,7 +410,7 @@ app.get('/api/health', wrap(async (_req, res) => {
     supabase.from('admin_panel').select('username').limit(1),
     supabase.from('admin_panel').select('password').limit(1),
   ]);
-  res.json({ status: 'ok', buckets, tables, adminPanelClean: Boolean(aLegacy.error), adminPanelHasPassword: !aPass.error, payu: getPayuConfigSummary() });
+  res.json({ status: 'ok', buckets, tables, adminPanelClean: Boolean(aLegacy.error), adminPanelHasPassword: !aPass.error, payu: { ...getPayuConfigSummary(), testMode: PAYMENT_TEST_MODE } });
 }));
 
 // ---------- auth ----------
@@ -1441,8 +1444,20 @@ app.get(
 app.post(
   '/api/payments/payu/sandbox-activate',
   auth,
-  wrap(async (_req, _res) => {
-    throw new HttpError(410, 'Sandbox bypass is disabled. Please complete payment via PayU checkout.');
+  wrap(async (req, res) => {
+    if (!PAYMENT_TEST_MODE) {
+      throw new HttpError(410, 'Sandbox bypass is disabled. Please complete payment via PayU checkout.');
+    }
+    const userId = req.auth.sub;
+    await activateSubscriber(userId, `test_mode_${Date.now()}`);
+    const updated = await getUser(userId);
+    res.json({
+      success: true,
+      test_mode: true,
+      payment_status: 'paid',
+      payment_active: true,
+      next_due_at: updated.next_due_at || null,
+    });
   }),
 );
 
