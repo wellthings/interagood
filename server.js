@@ -843,6 +843,10 @@ const LEGAL_DOCS = {
   terms: { path: 'instructions/common/terms&conditions', file: 'terms-and-conditions.txt' },
   privacy: { path: 'instructions/common/privacy-policy', file: 'privacy-policy.txt' },
 };
+const CLIENT_LEGAL_DOCS = {
+  terms: { path: 'instructions/client/terms&conditions', file: 'client-terms-and-conditions.txt' },
+  privacy: { path: 'instructions/client/privacy-policy', file: 'client-privacy-policy.txt' },
+};
 
 async function seedLegalDocs() {
   const { error } = await supabase.storage.createBucket(GUIDE_BUCKET, { public: false });
@@ -852,11 +856,17 @@ async function seedLegalDocs() {
     const { error: upErr } = await supabase.storage.from(GUIDE_BUCKET).upload(path, body, { contentType: 'text/plain; charset=utf-8', upsert: false });
     if (upErr && !/already exists|duplicate/i.test(upErr.message)) console.error('[storage] seed', path, upErr.message);
   }
+  for (const { path, file } of Object.values(CLIENT_LEGAL_DOCS)) {
+    const body = await readFile(new URL(`./content/${file}`, import.meta.url));
+    const { error: upErr } = await supabase.storage.from(GUIDE_BUCKET).upload(path, body, { contentType: 'text/plain; charset=utf-8', upsert: true });
+    if (upErr) console.error('[storage] seed client', path, upErr.message);
+  }
 }
 seedLegalDocs().catch((e) => console.error('[storage] seed', e.message));
 
 const guideDocPath = (role, doc) => {
   if (role === 'common') return LEGAL_DOCS[doc]?.path ?? null;
+  if (role === 'client') return CLIENT_LEGAL_DOCS[doc]?.path ?? null;
   if (!ROLES.includes(role) || !CONTENT_DOCS.includes(doc)) return null;
   return `instructions/${GUIDE_FOLDERS[role]}/${role}${doc}`;
 };
