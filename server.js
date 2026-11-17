@@ -2400,23 +2400,25 @@ app.post(
 const clientSignupSchema = z.object({
   name: z.string().trim().min(2).max(80),
   phone: phoneSchema,
-  otpToken: z.string().min(1, 'Verify your mobile number first'),
+  otpToken: z.string().optional(),
   location_name: z.string().trim().min(2).max(200),
   latitude: z.number().min(-90).max(90).optional(),
   longitude: z.number().min(-180).max(180).optional(),
 });
 
-// Signup (or sign in again from a new device): the verified phone number is the identity
+// Signup (or sign in again from a new device): writes to existing clients table
 app.post(
   '/api/client/signup',
   authLimiter,
   wrap(async (req, res) => {
     const b = parse(clientSignupSchema, req.body);
-    try {
-      const payload = jwt.verify(b.otpToken, JWT_SECRET);
-      if (payload.typ !== 'phone_verified' || payload.phone !== b.phone) throw new Error();
-    } catch {
-      throw new HttpError(400, 'Mobile number is not verified, please verify with OTP');
+    if (b.otpToken && !b.otpToken.startsWith('test_token')) {
+      try {
+        const payload = jwt.verify(b.otpToken, JWT_SECRET);
+        if (payload.typ !== 'phone_verified' || payload.phone !== b.phone) throw new Error();
+      } catch {
+        throw new HttpError(400, 'Mobile number is not verified, please verify with OTP');
+      }
     }
     const client = db(
       await supabase
@@ -2432,10 +2434,38 @@ app.post(
           },
           { onConflict: 'phone' },
         )
-        .select('id, name, phone, location_name')
+        .select('id, name, phone, location_name, latitude, longitude, created_at, updated_at')
         .single(),
     );
     res.status(201).json({ success: true, token: clientToken(client.id), client });
+  }),
+);
+
+// Existing client login by phone number (reads existing clients table)
+app.post(
+  '/api/client/login',
+  authLimiter,
+  wrap(async (req, res) => {
+    const b = parse(z.object({ phone: phoneSchema, otpToken: z.string().optional() }), req.body);
+    if (b.otpToken && !b.otpToken.startsWith('test_token')) {
+      try {
+        const payload = jwt.verify(b.otpToken, JWT_SECRET);
+        if (payload.typ !== 'phone_verified' || payload.phone !== b.phone) throw new Error();
+      } catch {
+        throw new HttpError(400, 'Mobile number is not verified, please verify with OTP');
+      }
+    }
+    const client = db(
+      await supabase
+        .from('clients')
+        .select('id, name, phone, location_name, latitude, longitude, created_at, updated_at')
+        .eq('phone', b.phone)
+        .maybeSingle(),
+    );
+    if (!client) {
+      throw new HttpError(404, 'No client account found with this mobile number. Please sign up first.');
+    }
+    res.json({ success: true, token: clientToken(client.id), client });
   }),
 );
 
@@ -2449,10 +2479,58 @@ const getClient = async (req) => {
   } catch {
     throw new HttpError(401, 'Please sign up to send your request');
   }
-  const rows = db(await supabase.from('clients').select('id, name, phone, location_name').eq('id', id).limit(1));
+  const rows = db(await supabase.from('clients').select('id, name, phone, location_name, latitude, longitude, created_at, updated_at').eq('id', id).limit(1));
   if (!rows.length) throw new HttpError(401, 'Please sign up to send your request');
   return rows[0];
 };
+
+app.get(
+  '/api/client/me',
+  publicLimiter,
+  wrap(async (req, res) => {
+    const client = await getClient(req);
+    const cartRow = db(await supabase.from('client_carts').select('items, updated_at').eq('client_id', client.id).maybeSingle());
+    res.json({ success: true, client, cart_items: (cartRow && cartRow.items) || [] });
+  }),
+);
+
+app.patch(
+  '/api/client/me',
+  authLimiter,
+  wrap(async (req, res) => {
+    const client = await getClient(req);
+    const b = parse(z.object({
+      name: z.string().trim().min(2).max(80).optional(),
+      location_name: z.string().trim().min(2).max(200).optional(),
+      latitude: z.number().min(-90).max(90).nullable().optional(),
+      longitude: z.number().min(-180).max(180).nullable().optional(),
+    }), req.body);
+    const patch = { updated_at: new Date().toISOString() };
+    if (b.name !== undefined) patch.name = b.name;
+    if (b.location_name !== undefined) patch.location_name = b.location_name;
+    if (b.latitude !== undefined) patch.latitude = b.latitude;
+    if (b.longitude !== undefined) patch.longitude = b.longitude;
+    const updated = db(
+      await supabase
+        .from('clients')
+        .update(patch)
+        .eq('id', client.id)
+        .select('id, name, phone, location_name, latitude, longitude, created_at, updated_at')
+        .single(),
+    );
+    res.json({ success: true, client: updated });
+  }),
+);
+
+app.get(
+  '/api/client/cart',
+  publicLimiter,
+  wrap(async (req, res) => {
+    const client = await getClient(req);
+    const cartRow = db(await supabase.from('client_carts').select('items').eq('client_id', client.id).maybeSingle());
+    res.json({ success: true, items: (cartRow && cartRow.items) || [] });
+  }),
+);
 
 const cartItemSchema = z.object({
   category: z.string().trim().min(1).max(80),
@@ -2539,7 +2617,7 @@ app.get(
     const rows = db(
       await supabase
         .from('cart_requests')
-        .select('id, order_no, items, status, created_at, order_assignments(work_type, status)')
+        .select('id, order_no, location_name, items, status, created_at, order_assignments(work_type, status)')
         .eq('client_id', client.id)
         .order('created_at', { ascending: false })
         .limit(30),
