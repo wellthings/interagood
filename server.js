@@ -2186,23 +2186,33 @@ app.get(
   publicLimiter,
   wrap(async (req, res) => {
     const roleFilter = req.query.role ? String(req.query.role) : null;
+    const usersRes = await supabase
+      .from('users')
+      .select('id, role, username, phone')
+      .in('role', ['partner', 'architect', 'supplier'])
+      .limit(400);
     const profRes = await supabase
       .from('profiles')
-      .select('*, onboarding(skill_level), dashboard(is_online), users!inner(role, username, phone)')
-      .not('business_name', 'is', null)
-      .limit(200);
-    const profiles = (!profRes.error && profRes.data) ? profRes.data : [];
+      .select('*, onboarding(skill_level), dashboard(is_online)')
+      .limit(400);
+
     const byUser = new Map();
-    profiles.forEach((p) => {
-      const u = p.users || {};
-      byUser.set(p.user_id, {
-        id: p.user_id,
+    const profMap = new Map();
+    ((!profRes.error && profRes.data) ? profRes.data : []).forEach((p) => {
+      profMap.set(p.user_id, p);
+    });
+
+    ((!usersRes.error && usersRes.data) ? usersRes.data : []).forEach((u) => {
+      const p = profMap.get(u.id) || {};
+      const roleLabel = u.role === 'architect' ? 'Architect' : u.role === 'supplier' ? 'Supplier' : 'Partner';
+      byUser.set(u.id, {
+        id: u.id,
         role: u.role,
-        username: u.username,
-        business_name: p.business_name,
-        profile_photo_url: p.profile_photo_url,
-        banner_url: p.banner_url,
-        category_name: p.category_name,
+        username: u.username || '',
+        business_name: p.business_name || u.username || ('Verified ' + roleLabel),
+        profile_photo_url: p.profile_photo_url || null,
+        banner_url: p.banner_url || null,
+        category_name: p.category_name || '',
         skill_level: (p.onboarding && p.onboarding.skill_level) || 'intermediate',
         city: p.city || '',
         is_online: !(p.dashboard && p.dashboard.is_online === false),
@@ -2219,13 +2229,22 @@ app.get(
       .eq('is_private', false)
       .neq('role', 'partner')
       .order('created_at', { ascending: false })
-      .limit(120);
+      .limit(150);
+
+    let allSamplesRaw = [];
+    const smpRes = await supabase
+      .from('user_samples')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(240);
+    if (!smpRes.error && smpRes.data) {
+      allSamplesRaw = smpRes.data;
+    }
 
     if (!res1.error && res1.data) {
       listings = res1.data;
     } else {
-      const fbRes = await supabase.from('user_samples').select('*').order('created_at', { ascending: false }).limit(120);
-      const fb = (!fbRes.error && fbRes.data) ? fbRes.data.filter((r) => isProductFallbackCaption(r.caption)) : [];
+      const fb = allSamplesRaw.filter((r) => isProductFallbackCaption(r.caption));
       listings = fb.map((s) => {
         let meta = {};
         try { if (s.caption && s.caption.startsWith('{')) meta = JSON.parse(s.caption); } catch {}
@@ -2256,11 +2275,48 @@ app.get(
       .filter((l) => !roleFilter || l.role === roleFilter)
       .map((l) => ({ ...l, creator: byUser.get(l.user_id) || null }));
 
+    const resolvedSamples = await resolveSampleUrls(
+      allSamplesRaw.filter((r) => !isProductFallbackCaption(r.caption))
+    );
+    const enrichedSamples = resolvedSamples
+      .map((s) => {
+        const creator = byUser.get(s.user_id) || null;
+        const r = (creator && creator.role) || s.role || 'partner';
+        if (roleFilter && r !== roleFilter) return null;
+        return {
+          id: s.id,
+          user_id: s.user_id,
+          role: r,
+          media_type: s.media_type || 'image',
+          title: s.title || 'Work Sample',
+          caption: s.caption || '',
+          media_url: s.media_url,
+          thumbnail_url: s.thumbnail_url || s.media_url,
+          price: Number(s.price) || 0,
+          price_unit: s.price_unit || 'pcs',
+          category_name: (creator && creator.category_name) || '',
+          created_at: s.created_at,
+          creator: creator || {
+            id: s.user_id,
+            role: r,
+            username: s.username || '',
+            business_name: s.business_name || s.username || ('Verified ' + (r === 'architect' ? 'Architect' : r === 'supplier' ? 'Supplier' : 'Partner')),
+            category_name: '',
+            city: '',
+            verified: true,
+            masked_phone: s.phone ? maskPhone(s.phone) : '',
+          },
+        };
+      })
+      .filter(Boolean);
+
     res.json({
       success: true,
       supplier_products: enriched.filter((l) => l.role === 'supplier'),
+      supplier_samples: enrichedSamples.filter((s) => s.role === 'supplier'),
       architect_posts: enriched.filter((l) => l.role === 'architect'),
-      creators: Array.from(byUser.values()).filter((c) => c.role === 'supplier' || c.role === 'architect'),
+      work_samples: enrichedSamples.filter((s) => s.role === 'partner' || s.role === 'architect'),
+      creators: Array.from(byUser.values()),
     });
   }),
 );
@@ -2274,7 +2330,7 @@ app.get(
     if (!['call', 'chat'].includes(action)) throw new HttpError(400, 'Invalid action');
     if (!z.string().uuid().safeParse(req.params.id).success) throw new HttpError(400, 'Invalid profile id');
     const user = await getUser(req.params.id);
-    if (!['supplier', 'architect'].includes(user.role)) throw new HttpError(404, 'Profile not found');
+    if (!['partner', 'supplier', 'architect'].includes(user.role)) throw new HttpError(404, 'Profile not found');
     const number = `91${normalizePhone(user.phone)}`;
     const url =
       action === 'call'
