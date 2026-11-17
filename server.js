@@ -1888,9 +1888,6 @@ app.post(
   requireActive,
   wrap(async (req, res) => {
     const user = await getUser(req.params.uuid);
-    if (user.role === 'partner') {
-      throw new HttpError(403, 'Product listings are not available for partner accounts.');
-    }
     const b = parse(listingSchema, req.body);
     const quota = await getQuotaForUser(user.id);
     if (quota.products.totalUsed >= PRODUCT_DAILY_LIMIT) {
@@ -2273,9 +2270,8 @@ app.get(
       .select('*')
       .eq('is_active', true)
       .eq('is_private', false)
-      .neq('role', 'partner')
       .order('created_at', { ascending: false })
-      .limit(150);
+      .limit(180);
 
     let allSamplesRaw = [];
     const smpRes = await supabase
@@ -2314,7 +2310,7 @@ app.get(
           is_private: !!meta.is_private,
           created_at: s.created_at,
         };
-      }).filter((x) => !x.is_private && x.role !== 'partner');
+      }).filter((x) => !x.is_private);
     }
 
     const enriched = listings
@@ -2361,6 +2357,7 @@ app.get(
       supplier_products: enriched.filter((l) => l.role === 'supplier'),
       supplier_samples: enrichedSamples.filter((s) => s.role === 'supplier'),
       architect_posts: enriched.filter((l) => l.role === 'architect'),
+      partner_products: enriched.filter((l) => l.role === 'partner'),
       work_samples: enrichedSamples.filter((s) => s.role === 'partner' || s.role === 'architect'),
       creators: Array.from(byUser.values()),
     });
